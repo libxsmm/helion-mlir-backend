@@ -110,3 +110,124 @@ def _specialized_block(ctx: BuildContext, key: str) -> int | None:
         and info.block_id in ctx.block_id_to_bounds
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+def index_lower_bound(ctx: BuildContext, index_node: object) -> int | None:
+    """A lower bound of the values the index expression ``index_node`` takes,
+    if one follows statically from the lower bounds of the loops it uses.
+
+    Understood: integers, tile indices (``tile.index``, plus a constant:
+    ``tile_with_offset``) and scalar loop positions (``tile.begin``, grid
+    indices: a SymInt linear in them with positive coefficients) at their
+    loop's static lower bound, and sums and differences of those with
+    constants (``tile.index - 1``, ``tile.begin - 1``, ``tile.index + kw - 1``).
+    Anything else (loads, runtime sizes, products) has no bound (``None``).
+    """
+    import operator
+
+    import torch
+    import torch.fx
+
+    if isinstance(index_node, bool):
+        return None
+    if isinstance(index_node, int):
+        return index_node
+    if isinstance(index_node, torch.SymInt):
+        return _symint_lower_bound(ctx, index_node)
+    if not isinstance(index_node, torch.fx.Node):
+        return None
+
+    tile_meta = index_node.meta.get("tile_with_offset")
+    if tile_meta is not None:
+        begin = _loop_lower_bound(ctx, tile_meta.get("block_id"))
+        offset = tile_meta.get("offset", 0)
+        if begin is None or not isinstance(offset, int):
+            return None
+        return begin + offset
+
+    target = index_node.target
+    args = index_node.args
+    if target is tracing_ops._get_symnode or index_node.op != "call_function":
+        return _symint_lower_bound(ctx, index_node.meta.get("val"))
+    if _is_tile_index(target) and args:
+        from helion._compiler.compile_environment import CompileEnvironment
+
+        tile = args[0].meta.get("val") if isinstance(args[0], torch.fx.Node) else None
+        if not isinstance(tile, torch.SymInt):
+            return None
+        return _loop_lower_bound(ctx, CompileEnvironment.current().get_block_id(tile))
+    if index_node.kwargs or len(args) != 2:
+        return _symint_lower_bound(ctx, index_node.meta.get("val"))
+    add = (operator.add, torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar)
+    sub = (operator.sub, torch.ops.aten.sub.Tensor, torch.ops.aten.sub.Scalar)
+    if target in add:
+        bounds = [index_lower_bound(ctx, arg) for arg in args]
+        return None if None in bounds else bounds[0] + bounds[1]
+    if target in sub:
+        lhs = index_lower_bound(ctx, args[0])
+        rhs = _constant(args[1])
+        return None if lhs is None or rhs is None else lhs - rhs
+    return _symint_lower_bound(ctx, index_node.meta.get("val"))
+
+
+def _is_tile_index(target: object) -> bool:
+    import helion.language as hl
+
+    return target is hl.tile_index or getattr(target, "__name__", None) == "tile_index"
+
+
+def _constant(value: object) -> int | None:
+    """``value`` as an integer, if it is one (an int, a constant SymInt, or an
+    FX node of one)."""
+    import torch
+    import torch.fx
+
+    if isinstance(value, torch.fx.Node):
+        value = value.meta.get("val")
+    if isinstance(value, torch.SymInt) and not value.node.expr.free_symbols:
+        value = int(value.node.expr)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _loop_lower_bound(ctx: BuildContext, block_id: int | None) -> int | None:
+    """The static lower bound of ``block_id``'s active loop, if any."""
+    if block_id is None:
+        return None
+    bounds = ctx.block_id_to_bounds.get(block_id)
+    if bounds is None or not isinstance(bounds[0], int):
+        return None
+    return bounds[0]
+
+
+def _symint_lower_bound(ctx: BuildContext, value: object) -> int | None:
+    """A lower bound of the SymInt ``value``: linear with positive integer
+    coefficients in loop positions (``tile.begin``, grid indices), each at
+    its loop's static lower bound."""
+    import sympy
+    import torch
+
+    from .block_ids import symbol_origin_info
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, torch.SymInt):
+        return None
+    expr = value.node.expr
+    lowest = {}
+    for symbol in expr.free_symbols:
+        info = symbol_origin_info(ctx.host_function, symbol)
+        if info is None or info[1] not in OFFSET_SYMBOL_KINDS:
+            return None
+        slope = sympy.diff(expr, symbol)
+        if not (slope.is_Integer and slope > 0):
+            return None
+        begin = _loop_lower_bound(ctx, info[0])
+        if begin is None:
+            return None
+        lowest[symbol] = begin
+    bound = expr.subs(lowest)
+    return int(bound) if bound.is_Integer else None

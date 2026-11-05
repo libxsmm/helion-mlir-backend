@@ -9,23 +9,29 @@ in the terminator; an ``scf.for`` carries the tensors its body writes.
 from __future__ import annotations
 
 import logging
+import operator
 from typing import TYPE_CHECKING
 
+from helion.language import memory_ops as hl_memory
 import helion.language._tracing_ops as tracing_ops
 from mlir.dialects import affine as affine_d
 from mlir.dialects import arith as arith_d
 from mlir.dialects import scf as scf_d
+from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 import torch
 
+from ..analysis.geometry import LOOP_TARGETS
 from ..analysis.geometry import LoopBounds
 from ..analysis.geometry import loop_block_ids
 from ..analysis.tensor_effects import accessed_tensor
 from ..support import NodeLoweringError
+from ..support import UnsupportedOperationError
 from . import emit
 from .control_flow import carried_positions
 from .control_flow import lower_subgraph
 from .control_flow import with_carried
+from .registry import COUNTING_REDUCTIONS
 from .registry import lowers
 from .slice_plan import tile_window
 from .tensor_state import OwnedDim
@@ -55,8 +61,44 @@ def build_phase_body(
     return [ctx.tensors.value(name) for name in outputs]
 
 
+_SUMS = (torch.ops.aten.sum.dim_IntList, torch.ops.aten.sum.default)
+_KEEP_ZERO_AFTER = (
+    tracing_ops._phi,
+    operator.getitem,
+    tracing_ops._mask_to,
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.mul.Scalar,
+    torch.ops.aten.neg.default,
+)
+"""Ops after a loop that leave a padded 0 at 0."""
+_SAME_ELEMENTS = (
+    torch.ops.aten.permute.default,
+    torch.ops.aten.transpose.int,
+    torch.ops.aten.unsqueeze.default,
+    torch.ops.aten.squeeze.dim,
+    torch.ops.aten.clone.default,
+    torch.ops.prims.convert_element_type.default,
+)
+"""Ops that move or cast elements: a 0 stays a 0."""
+
+
 def _lower_root(ctx: BuildContext, graph_id: int, grid_ids: list[int]) -> None:
     """Parallel ``scf.forall`` if each iteration writes disjoint regions, else sequential."""
+    if len(set(grid_ids)) != len(grid_ids):
+        raise UnsupportedOperationError(
+            "nested tile loops of one block size",
+            reason=(
+                "both loops have one block id, from one block size or from one "
+                "bounded by the other: their tiles would index with the inner "
+                "loop's position"
+            ),
+            alternatives=[
+                (
+                    "hl.register_block_size for each loop, bounded by a tensor's size, "
+                    "not by another block size"
+                )
+            ],
+        )
     geometry = ctx.geometry
     bounds = [
         LoopBounds(ctx.sizes.value(bound.begin), ctx.sizes.value(bound.end), bound.step)
@@ -188,11 +230,82 @@ def _lower_tile(
             ctx.block_id_to_bounds[block_id],
             span=tile,
         )
-        scf_d.YieldOp(_lower_tile(ctx, graph, region_values, owned, rest))
+        # The full version's regions have the tile's static extent: its stores
+        # then overwrite them whole and bufferize in place.
+        full_values = {
+            name: _cast_dims(value, owned[name], block_id, tile, valid)
+            for name, value in region_values.items()
+        }
+        results = _lower_tile(ctx, graph, full_values, owned, rest)
+        scf_d.YieldOp(
+            [
+                tensor_d.CastOp(value.type, result).result
+                if result.type != value.type
+                else result
+                for result, value in zip(results, region_values.values(), strict=True)
+            ]
+        )
     ctx.block_id_to_valid[block_id] = valid
     with ir.InsertionPoint(if_op.else_block):
         scf_d.YieldOp(_lower_tile(ctx, graph, region_values, owned, rest))
     return list(if_op.results)
+
+
+def _cast_dims(
+    value: ir.Value,
+    owned: dict[int, OwnedDim],
+    block_id: int,
+    extent: int,
+    valid: ir.Value,
+) -> ir.Value:
+    """``value`` (a region) cast to the static ``extent`` along its dynamic dims
+    that tile ``block_id`` and whose size is the tile's ``valid`` size itself
+    (``value`` itself if there are none).
+
+    A full tile (``valid`` = ``extent``) fills exactly those dims. A dim whose
+    size is clamped to the tensor (an output shorter than the loop: the region
+    is ``min(valid, size - offset)``) may be shorter even then, and is left
+    dynamic: cast, its store would write past the tensor.
+    """
+    value_type = ir.RankedTensorType(value.type)
+    shape = list(value_type.shape)
+    for dim, owner in owned.items():
+        if (
+            owner.block_id == block_id
+            and not owner.point
+            and shape[dim] == ir.ShapedType.get_dynamic_size()
+            and _region_size(value, dim) == valid
+        ):
+            shape[dim] = extent
+    if shape == list(value_type.shape):
+        return value
+    cast_type = ir.RankedTensorType.get(shape, value_type.element_type)
+    return tensor_d.CastOp(cast_type, value).result
+
+
+def _region_size(value: ir.Value, dim: int) -> ir.Value | None:
+    """The dynamic size of dim ``dim`` of the ``tensor.extract_slice`` that
+    ``value`` is (through ``tensor.cast``s), ``None`` if it is static or
+    ``value`` is no such slice."""
+    while isinstance(value, ir.OpResult) and value.owner.name == "tensor.cast":
+        value = value.owner.operands[0]
+    if not isinstance(value, ir.OpResult) or value.owner.name != "tensor.extract_slice":
+        return None
+    slice_op = value.owner
+    static = list(ir.DenseI64ArrayAttr(slice_op.attributes["static_sizes"]))
+    # A rank-reducing slice's result dims are not its size list's dims.
+    if len(static) != ir.RankedTensorType(value.type).rank:
+        return None
+    if static[dim] != ir.ShapedType.get_dynamic_size():
+        return None
+    # operandSegmentSizes: source, offsets, sizes, strides.
+    segments = list(ir.DenseI32ArrayAttr(slice_op.attributes["operandSegmentSizes"]))
+    start = sum(segments[:2])
+    sizes = list(slice_op.operands[start : start + segments[2]])
+    dynamic_index = sum(
+        1 for size in static[:dim] if size == ir.ShapedType.get_dynamic_size()
+    )
+    return sizes[dynamic_index]
 
 
 def _emit_sequential(
@@ -291,39 +404,433 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> emit.Result
     inputs = [ctx.get_value(arg) for arg in args]
     positions = carried_positions(node, args, body)
     names = list(ctx.effects.writes(graph_id))
+    running = _running_nodes(ctx, args, positions, body)
 
-    def emit_level(level: int, carried: list[ir.Value]) -> list[ir.Value]:
-        if level == len(block_ids):
-            return lower_subgraph(ctx, body, with_carried(inputs, positions, carried))
-        begin = _resolve_loop_bound(ctx, node, bounds[level].begin)
-        end = _resolve_loop_bound(ctx, node, bounds[level].end)
+    def emit_loop(
+        level: int,
+        begin: int | ir.Value,
+        end: int | ir.Value,
+        carried: list[ir.Value],
+    ) -> list[ir.Value]:
+        # A lower bound that is a value counts from 0, with the offset in the body.
+        moved = isinstance(begin, ir.Value)
         for_op = scf_d.ForOp(
-            ctx.as_index(begin),
-            ctx.as_index(end),
+            ctx.index_const(0) if moved else ctx.as_index(begin),
+            arith_d.SubIOp(ctx.as_index(end), begin).result
+            if moved
+            else ctx.as_index(end),
             ctx.index_const(bounds[level].step),
             iter_args=[*carried, *(ctx.tensors.value(name) for name in names)],
         )
         count = len(carried)
         block_args = list(for_op.inner_iter_args)
+        with ir.InsertionPoint(for_op.body):
+            offset = for_op.induction_variable
+            if moved:
+                offset = arith_d.AddIOp(begin, offset).result
         with (
             ir.InsertionPoint(for_op.body),
             ctx.enter_for_loop(
                 block_ids[level],
-                for_op.induction_variable,
+                offset,
                 (begin, end),
                 _enclosing_span(ctx, block_ids[level]),
             ),
         ):
+            _refuse_unmaskable_running(ctx, block_ids[level], running, body, positions)
+            _refuse_reduced_after_loop(ctx, block_ids[level], node, running, body)
             for name, arg in zip(names, block_args[count:], strict=True):
                 ctx.tensors.rebind(name, arg)
             yields = emit_level(level + 1, block_args[:count])
+            yields = _keep_past_tile(
+                ctx, block_ids[level], yields, block_args[:count], running
+            )
             scf_d.YieldOp([*yields, *(ctx.tensors.value(name) for name in names)])
         results = list(for_op.results)
         for name, result in zip(names, results[count:], strict=True):
             ctx.tensors.rebind(name, result)
         return results[:count]
 
+    def emit_level(level: int, carried: list[ir.Value]) -> list[ir.Value]:
+        if level == len(block_ids):
+            return lower_subgraph(ctx, body, with_carried(inputs, positions, carried))
+        begin = _resolve_loop_bound(ctx, node, bounds[level].begin)
+        end = _resolve_loop_bound(ctx, node, bounds[level].end)
+        step = bounds[level].step
+        # Whole tiles first, as if no tile were partial, so that a running value
+        # is updated in place; only the partial tile keeps elements of the old one.
+        whole_end = (
+            _whole_tiles_end(begin, end, step)
+            if _tile_dims(ctx, block_ids[level], running)
+            else end
+        )
+        if whole_end is not end:
+            carried = emit_loop(level, begin, whole_end, carried)
+            begin = whole_end
+        return emit_loop(level, begin, end, carried)
+
     return emit.Results(emit_level(0, [inputs[position] for position in positions]))
+
+
+def _running_nodes(
+    ctx: BuildContext,
+    args: list[torch.fx.Node],
+    positions: list[int],
+    body: torch.fx.Graph,
+) -> list[torch.fx.Node | None]:
+    """Per carried variable its arg, ``None`` if the body's new value doesn't read
+    the old one: that is the last tile's value, not a running one."""
+    placeholders = list(body.find_nodes(op="placeholder"))
+    (outputs,) = next(iter(body.find_nodes(op="output"))).args
+    outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+    running: list[torch.fx.Node | None] = []
+    for position, output in zip(positions, outputs, strict=True):
+        seen: set[torch.fx.Node] = set()
+        stack = [output] if isinstance(output, torch.fx.Node) else []
+        while stack:
+            current = stack.pop()
+            # Only its sizes, as a load's tile extents, aren't the old value.
+            if (
+                current not in seen
+                and current.target is not torch.ops.aten.sym_size.int
+            ):
+                seen.add(current)
+                stack.extend(_data_inputs(ctx, current))
+        running.append(args[position] if placeholders[position] in seen else None)
+    return running
+
+
+def _is_loop(node: torch.fx.Node) -> bool:
+    return node.op == "call_function" and node.target in LOOP_TARGETS
+
+
+def _data_inputs(ctx: BuildContext, node: torch.fx.Node) -> list[torch.fx.Node]:
+    """``node``'s inputs, without a loop's args its body only takes the sizes of."""
+    if node.op == "call_function" and node.target is tracing_ops._phi:
+        before, after = node.args[0], node.args[1]
+        if isinstance(after, torch.fx.Node) and _is_loop(after.args[0]):
+            # The value a nested loop assigns: "before" only if it has no trip.
+            return [after]
+        return [before, after]
+    if not _is_loop(node):
+        return list(node.all_input_nodes)
+    inner = ctx.host_function.device_ir.graphs[node.args[0]].graph
+    placeholders = list(inner.find_nodes(op="placeholder"))
+    skipped = {
+        arg
+        for arg, placeholder in zip(node.args[3], placeholders, strict=False)
+        if not _reads_data(ctx, placeholder)
+    }
+    return [value for value in node.all_input_nodes if value not in skipped]
+
+
+def _reads_data(ctx: BuildContext, placeholder: torch.fx.Node) -> bool:
+    """A value of ``placeholder`` is read, not just its sizes."""
+    for user in placeholder.users:
+        if user.target is torch.ops.aten.sym_size.int:
+            continue
+        if not _is_loop(user):
+            return True
+        inner = ctx.host_function.device_ir.graphs[user.args[0]].graph
+        for arg, inner_placeholder in zip(
+            user.args[3], inner.find_nodes(op="placeholder"), strict=False
+        ):
+            if arg is placeholder and _reads_data(ctx, inner_placeholder):
+                return True
+    return False
+
+
+def _refuse_unmaskable_running(
+    ctx: BuildContext,
+    block_id: int,
+    running: list[torch.fx.Node | None],
+    body: torch.fx.Graph,
+    positions: list[int],
+) -> None:
+    """Refuse a running value a partial tile leaves wrong, silently."""
+    if block_id not in ctx.block_id_to_valid:
+        return
+    placeholders = list(body.find_nodes(op="placeholder"))
+    tile = ctx.geometry.tile_extent(block_id)
+    for position, node in zip(positions, running, strict=True):
+        if node is None or not isinstance(node.meta["val"], torch.Tensor):
+            continue
+        shape = node.meta["val"].shape
+        if any(
+            isinstance(size, int) and size == tile for size in shape
+        ) and not _tile_has_symbol(ctx, block_id, body):
+            raise UnsupportedOperationError(
+                "a running value sized by a number over a partial tile",
+                reason=(
+                    f"its dim of {tile} isn't tied to the loop's tile, so the "
+                    "tile's padding can't be kept out of it"
+                ),
+                alternatives=[
+                    "the size from hl.register_block_size, for both",
+                    "block sizes that divide the sizes they tile, with static_shapes=True",
+                ],
+            )
+        if not any(ctx.env.resolve_block_id(size) == block_id for size in shape):
+            continue
+        if _masked_inside(ctx, placeholders[position], body):
+            raise UnsupportedOperationError(
+                "a running value reduced inside a loop with a partial tile",
+                reason=(
+                    "the tile's mask would hide its elements past the partial "
+                    "tile, which hold earlier tiles' values"
+                ),
+                alternatives=[
+                    "the reduction after the loop",
+                    "block sizes that divide the sizes they tile, with static_shapes=True",
+                ],
+            )
+
+
+def _refuse_reduced_after_loop(
+    ctx: BuildContext,
+    block_id: int,
+    loop: torch.fx.Node,
+    running: list[torch.fx.Node | None],
+    body: torch.fx.Graph,
+) -> None:
+    """Refuse a use, after a loop with a partial tile, of the value of its last tile
+    that reduces or stores it or that a sibling loop reads: nothing masks the padding
+    there. Only a direct sum or store of padding provably still 0 is allowed; others
+    that happen to be right (``x * exp(-x)``, a sum in a sibling loop) are refused."""
+    if block_id not in ctx.block_id_to_valid:
+        return
+    (outputs,) = next(iter(body.find_nodes(op="output"))).args
+    outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+    for index, (node, output) in enumerate(zip(running, outputs, strict=True)):
+        if node is None and not all(
+            kept and keeps_zero(ctx, output)
+            for kept in _uses_after_loop(ctx, block_id, loop, index)
+        ):
+            raise UnsupportedOperationError(
+                "a use after a loop of its last partial tile's value",
+                reason="the loop's tile isn't active there, so its padding counts",
+                alternatives=[
+                    "the reduction or store inside the loop",
+                    (
+                        "block sizes that divide the sizes they tile, with "
+                        "static_shapes=True"
+                    ),
+                ],
+            )
+
+
+def _uses_after_loop(
+    ctx: BuildContext, block_id: int, loop: torch.fx.Node, index: int
+) -> list[bool]:
+    """For the uses that end the loop's result ``index`` (reductions over the tile's
+    dim, stores), through enclosing loops too: whether padding that was 0 still counts
+    as 0 there."""
+    uses: list[bool] = []
+    stack = [(user, True) for user in _result_users(loop, index)]
+    seen: set[tuple[torch.fx.Node, bool]] = set()
+    while stack:
+        current, clean = stack.pop()
+        if (current, clean) in seen:
+            continue
+        seen.add((current, clean))
+        for user in current.users:
+            if user.op == "output":
+                (outputs,) = user.args
+                outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+                enclosing = _enclosing_loop(ctx, user.graph)
+                if enclosing is not None and current in outputs:
+                    stack.extend(
+                        (next_user, clean)
+                        for next_user in _result_users(
+                            enclosing, outputs.index(current)
+                        )
+                    )
+            elif user.target is torch.ops.aten.sym_size.int:
+                continue
+            elif _is_loop(user):
+                inner = ctx.host_function.device_ir.graphs[user.args[0]].graph
+                if any(
+                    arg is current and _reads_data(ctx, placeholder)
+                    for arg, placeholder in zip(
+                        user.args[3], inner.find_nodes(op="placeholder"), strict=False
+                    )
+                ):
+                    uses.append(False)
+            elif any(
+                reader.target in COUNTING_REDUCTIONS for reader in (user, *user.users)
+            ):
+                uses.append(False)
+            elif user.target is hl_memory.store:
+                uses.append(clean)
+            elif current.target is tracing_ops._mask_to:
+                kept = clean and current.args[1] == 0 and user.target in _SUMS
+                if _has_tile_dim(ctx, block_id, user):
+                    # It reduces another dim: the tile's is still there.
+                    stack.append((user, kept))
+                else:
+                    uses.append(kept)
+            elif user.target is tracing_ops._mask_to or (
+                _has_tile_dim(ctx, block_id, user)
+            ):
+                kept = user.target in (*_KEEP_ZERO_AFTER, *_SUMS)
+                stack.append((user, clean and kept))
+            else:
+                uses.append(clean and user.target in _SUMS)
+    return uses
+
+
+def _result_users(loop: torch.fx.Node, index: int) -> list[torch.fx.Node]:
+    return [
+        user
+        for user in loop.users
+        if user.target is operator.getitem and user.args[1] == index
+    ]
+
+
+def _enclosing_loop(ctx: BuildContext, body: torch.fx.Graph) -> torch.fx.Node | None:
+    """The loop whose body is ``body``."""
+    graphs = ctx.host_function.device_ir.graphs
+    for info in graphs.values() if isinstance(graphs, dict) else graphs:
+        for node in info.graph.nodes:
+            if _is_loop(node) and graphs[node.args[0]].graph is body:
+                return node
+    return None
+
+
+def _has_tile_dim(ctx: BuildContext, block_id: int, node: torch.fx.Node) -> bool:
+    value = node.meta.get("val")
+    return isinstance(value, torch.Tensor) and any(
+        ctx.env.resolve_block_id(size) == block_id for size in value.shape
+    )
+
+
+def keeps_zero(ctx: BuildContext, node: object) -> bool:
+    """``node``, in a loop's body, is 0 where the tiles it loads are padded."""
+    if not isinstance(node, torch.fx.Node):
+        return False
+    if node.target is hl_memory.load:
+        return True
+    if node.op == "placeholder":
+        enclosing = _enclosing_loop(ctx, node.graph)
+        if enclosing is None:
+            return False
+        position = list(node.graph.find_nodes(op="placeholder")).index(node)
+        return keeps_zero(ctx, enclosing.args[3][position])
+    if node.target is tracing_ops._mask_to:
+        return node.args[1] == 0
+    if node.target in _SAME_ELEMENTS:
+        return keeps_zero(ctx, node.args[0])
+    if node.target is tracing_ops._phi:
+        return keeps_zero(ctx, node.args[1])
+    if node.target is operator.getitem and _is_loop(node.args[0]):
+        inner = ctx.host_function.device_ir.graphs[node.args[0].args[0]].graph
+        (outputs,) = next(iter(inner.find_nodes(op="output"))).args
+        outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+        return keeps_zero(ctx, outputs[node.args[1]])
+    operands = [keeps_zero(ctx, arg) for arg in node.args]
+    if node.target in (torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar):
+        # 0 times a value computed from padding may not be 0: 0 / 0, 0 * inf.
+        return any(operands) and all(
+            kept or not isinstance(arg, torch.fx.Node)
+            for kept, arg in zip(operands, node.args, strict=False)
+        )
+    if node.target in (
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Tensor,
+        torch.ops.aten.neg.default,
+    ):
+        return all(operands)
+    return False
+
+
+def _tile_has_symbol(ctx: BuildContext, block_id: int, body: torch.fx.Graph) -> bool:
+    """Some value in ``body`` has a dim of the loop's tile by its block size's symbol:
+    numbers equal to the tile are other dims (a head dim). A loop with a number as
+    its block size has no such value."""
+    for node in body.nodes:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor) and any(
+            ctx.env.resolve_block_id(size) == block_id for size in value.shape
+        ):
+            return True
+    return False
+
+
+def _masked_inside(
+    ctx: BuildContext, placeholder: torch.fx.Node, body: torch.fx.Graph
+) -> bool:
+    """A value computed from ``placeholder`` reaches a ``_mask_to`` in ``body`` or
+    in a loop nested in it."""
+    reached = {placeholder}
+    for node in body.nodes:
+        if node.target is torch.ops.aten.sym_size.int:
+            continue
+        if any(value in reached for value in node.all_input_nodes):
+            if node.target is tracing_ops._mask_to:
+                return True
+            if _is_loop(node):
+                inner = ctx.host_function.device_ir.graphs[node.args[0]].graph
+                for arg, inner_arg in zip(
+                    node.args[3], inner.find_nodes(op="placeholder"), strict=False
+                ):
+                    if arg in reached and _masked_inside(ctx, inner_arg, inner):
+                        return True
+            reached.add(node)
+    return False
+
+
+def _tile_dims(
+    ctx: BuildContext, block_id: int, nodes: list[torch.fx.Node | None]
+) -> list[list[int]]:
+    """Per running value in ``nodes``, its dims in the loop's tile, where it has
+    any; nothing if the loop has no such value."""
+    dims = [
+        [
+            dim
+            for dim, size in enumerate(node.meta["val"].shape)
+            if ctx.env.resolve_block_id(size) == block_id
+        ]
+        if node is not None and isinstance(node.meta["val"], torch.Tensor)
+        else []
+        for node in nodes
+    ]
+    return dims if any(dims) else []
+
+
+def _whole_tiles_end(
+    begin: int | ir.Value, end: int | ir.Value, step: int
+) -> int | ir.Value:
+    """Where the loop's whole tiles end: ``end`` itself unless both bounds are static
+    and the last tile is partial. Runtime bounds stay one loop: a loop with no trip
+    has to stay so, and ``tile.count`` counts that loop's tiles."""
+    if isinstance(begin, int) and isinstance(end, int) and begin < end:
+        whole = begin + (end - begin) // step * step
+        return end if whole == end else whole
+    return end
+
+
+def _keep_past_tile(
+    ctx: BuildContext,
+    block_id: int,
+    yields: list[ir.Value],
+    carried: list[ir.Value],
+    nodes: list[torch.fx.Node | None],
+) -> list[ir.Value]:
+    """A running value (of the loop's body, reading its old value) with a dim of the
+    loop's tile keeps its elements past a partial tile's end: an iteration has no
+    elements there, so padding must not enter it (``top = maximum(top, x[tile])``).
+    Outside the loop nothing masks it, as the loop's tile isn't active there.
+    Without a partial tile there is no ``valid``, and nothing changes."""
+    valid = ctx.block_id_to_valid.get(block_id)
+    if valid is None:
+        return yields
+    dims = _tile_dims(ctx, block_id, nodes) or [[] for _ in nodes]
+    return [
+        emit.keep_past(value, old, dict.fromkeys(tile_dims, ctx.as_index(valid)))
+        if tile_dims
+        else value
+        for value, old, tile_dims in zip(yields, carried, dims, strict=True)
+    ]
 
 
 def _enclosing_span(ctx: BuildContext, block_id: int) -> int | None:

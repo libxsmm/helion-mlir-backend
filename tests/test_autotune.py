@@ -7,6 +7,7 @@ from unittest import mock
 
 import helion
 import helion.language as hl
+from lighthouse.pipeline.driver import BackendDriver
 import pytest
 import torch
 
@@ -15,10 +16,10 @@ from tests.harness import check_kernel
 from helion_mlir_backend import compile_mlir
 from helion_mlir_backend import generate_mlir
 from helion_mlir_backend._compiler import execution
-from helion_mlir_backend._compiler.mlir.autotune import cpu_name
 from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
-from helion_mlir_backend._compiler.mlir.backend import raise_block_minimums
 from helion_mlir_backend._compiler.mlir.support import CompileTimeoutError
+from helion_mlir_backend._compiler.targets.cpu import cpu_name
+from helion_mlir_backend._compiler.targets.cpu import raise_block_minimums
 from helion_mlir_backend.api import _compile
 
 
@@ -144,9 +145,15 @@ def test_config_selects_the_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     chosen: list[str] = []
     original = execution._lower
 
-    def record(module: object, entry: str, pipeline: str) -> object:
+    def record(
+        module: object,
+        entry: str,
+        target: object,
+        pipeline: str,
+        stop_at: str | None = None,
+    ) -> object:
         chosen.append(pipeline)
-        return original(module, entry, "scalar")
+        return original(module, entry, target, "scalar", stop_at)
 
     monkeypatch.setattr(execution, "_lower", record)
     monkeypatch.setattr(execution, "_JIT_CACHE", type(execution._JIT_CACHE)())
@@ -215,7 +222,7 @@ def test_lowering_errors_keep_their_type(monkeypatch: pytest.MonkeyPatch) -> Non
     def fail(*_: object) -> None:
         raise ValueError("lighthouse failed")
 
-    monkeypatch.setattr(execution.BackendDriver, "apply", fail)
+    monkeypatch.setattr(BackendDriver, "apply", fail)
     x, y = torch.randn(40, 40), torch.randn(40, 40)
     config = helion.Config(block_sizes=[32, 32])
     with pytest.raises(ValueError, match="lighthouse failed") as error:

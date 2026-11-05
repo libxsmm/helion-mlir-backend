@@ -103,6 +103,8 @@ def plan_slice(
     base: ir.Value,
     owned: dict[int, OwnedDim] | None = None,
     name: str | None = None,
+    *,
+    masked: bool = False,
 ) -> SlicePlan:
     """Build a SlicePlan from authoritative index metadata.
 
@@ -117,9 +119,13 @@ def plan_slice(
     ``owned`` marks dims where ``base`` is only the current iteration's region
     of a larger tensor (see ``tensor_state``); those are indexed from its origin.
     ``name`` is the host tensor ``base`` holds, for its runtime extents.
+    ``masked``: the access has an ``extra_mask`` (Helion's zero-padding idiom
+    ``hl.load(x, [t.index - 1], extra_mask=t.index >= 1)``), so its indices
+    may be negative where the mask is false.
 
     Raises NodeLoweringError if a tile index cannot be resolved to a block id.
     """
+    from ..analysis.signature import runtime_index_expr
     from ..support.errors import NodeLoweringError
     from ..support.index_meta import resolve_index_descriptor
 
@@ -181,6 +187,16 @@ def plan_slice(
             dims.append(DimSlice("tile", zero, size, tile, owner.block_id))
             continue
 
+        if isinstance(index_node, int) and not isinstance(index_node, bool):
+            dims.append(
+                _literal_scalar(
+                    ctx, index_node, ctx.sizes.extent(base, dimension, name)
+                )
+            )
+            continue
+        if not masked and not ctx.guard_depth:
+            _reject_negative(ctx, index_node, dimension, base_shape[dimension])
+
         if descriptor.is_scalar:
             block_id = descriptor.block_id
             if descriptor.is_offset and block_id in ctx.block_id_to_iv:
@@ -206,6 +222,12 @@ def plan_slice(
         if index is not None:
             # A position computed from runtime sizes, e.g. ``n - 1``.
             offset = ctx.cast_to_index(index)
+            if (
+                ctx.signature is not None
+                and runtime_index_expr(ctx.signature, index_node) is not None
+            ):
+                extent_value = ctx.as_index(ctx.sizes.extent(base, dimension, name))
+                offset = _from_the_end(ctx, offset, extent_value)
             dims.append(DimSlice("scalar", offset, 1, 1, reduces=True))
             continue
         if block_id is None:
@@ -228,6 +250,75 @@ def plan_slice(
         dims.append(full(len(dims), slice(None)))
 
     return SlicePlan(dims)
+
+
+def _from_the_end(ctx: BuildContext, offset: ir.Value, extent: ir.Value) -> ir.Value:
+    """A runtime position, counted from the end if negative, as a literal one is and
+    as torch does. The call refuses one out of bounds (``driver.call_entry``)."""
+    negative = arith_d.cmpi(arith_d.CmpIPredicate.slt, offset, ctx.index_const(0))
+    return arith_d.select(negative, arith_d.addi(offset, extent), offset)
+
+
+def _literal_scalar(ctx: BuildContext, index: int, extent: emit.Size) -> DimSlice:
+    """A literal integer position; a negative one counts from the end, as in
+    Python (``x[-1]`` is the last element)."""
+    if isinstance(extent, int) and index >= extent:
+        from ..support.errors import UnsupportedOperationError
+
+        raise UnsupportedOperationError(
+            "subscript",
+            reason=f"index {index} is out of bounds of a dimension of {extent}",
+        )
+    if index >= 0:
+        offset = ctx.index_const(index)
+    elif isinstance(extent, int):
+        if index < -extent:
+            from ..support.errors import UnsupportedOperationError
+
+            raise UnsupportedOperationError(
+                "subscript",
+                reason=f"index {index} is out of bounds of a dimension of {extent}",
+            )
+        offset = ctx.index_const(extent + index)
+    else:
+        offset = arith_d.addi(ctx.as_index(extent), ctx.index_const(index))
+    return DimSlice("scalar", offset, 1, 1, None, reduces=True)
+
+
+def _reject_negative(
+    ctx: BuildContext, index_node: object, dimension: int, extent: int
+) -> None:
+    """Raise if the computed index ``index_node`` of an unconditional, unmasked
+    access is negative at its loops' lower bounds (statically:
+    ``index_lower_bound``).
+
+    Helion leaves such indices undefined: its codegen may add them to the
+    tensor's address unchecked, while torch (and Helion's eager reference
+    mode) count them from the end. A shifted window (``x[tile.index - 1]``)
+    usually means zero padding, which only a mask or a guard gives
+    (``hl.load(..., extra_mask=...)``, an ``if``; those accesses are not
+    checked), so the kernel is rejected rather than read before the tensor
+    start or wrap silently."""
+    from ..support.errors import UnsupportedOperationError
+    from ..support.index_meta import index_lower_bound
+
+    bound = index_lower_bound(ctx, index_node)
+    if bound is not None and bound < 0:
+        size = "?" if ir.ShapedType.is_dynamic_size(extent) else str(extent)
+        raise UnsupportedOperationError(
+            "subscript",
+            reason=(
+                f"the index of dimension {dimension} (size {size}) is as low as "
+                f"{bound} on the first iteration of its loops, before the "
+                "tensor start, and the access is neither masked nor guarded"
+            ),
+            alternatives=[
+                "mask it: hl.load(x, [t.index - 1], extra_mask=t.index >= 1)",
+                "guard it with an if",
+                "start the loop later (hl.tile(1, n))",
+                "pad the tensor on the host",
+            ],
+        )
 
 
 def _inner_tile(
@@ -278,12 +369,29 @@ def tile_window(
     begin, end = ctx.block_id_to_bounds[block_id]
     # A loop over one enclosing tile ends within the enclosing loop.
     outer = block_id
+    seen = {block_id}
     while (
         isinstance(end, ir.Value)
         and (outer := ctx.geometry.enclosing_tiles.get(outer)) is not None
+        and outer not in seen
         and outer in ctx.block_id_to_bounds
     ):
+        seen.add(outer)
         end = ctx.block_id_to_bounds[outer][1]
+    low = ctx.index_facts(begin).low
+    if low is None or low + bias < 0:
+        where = "" if low is None else f" at {low + bias}"
+        raise UnsupportedOperationError(
+            "tile index",
+            reason=f"the loop may start{where}, before the tensor start",
+            alternatives=[
+                (
+                    "a lower bound of tile positions and constants clamped at 0: "
+                    "max(tm.begin - 16, 0)"
+                ),
+                "a runtime bound as hl.constexpr, clamped at 0",
+            ],
+        )
     if bias < 0 and not (isinstance(begin, int) and begin + bias >= 0):
         raise UnsupportedOperationError(
             "tile index", reason=f"offset {bias} may index before the tensor start"
@@ -291,6 +399,10 @@ def tile_window(
     if isinstance(end, int) and isinstance(extent, int) and end + bias <= extent:
         return offset, size, tile
     if bias == 0 and isinstance(end, ir.Value) and end == extent:
+        return offset, size, tile
+    # A loop ending at an enclosing tile's position stays inside that loop's range.
+    high = ctx.index_facts(end).high
+    if isinstance(extent, int) and high is not None and high + bias <= extent:
         return offset, size, tile
     d0 = ir.AffineDimExpr.get(0)
     if isinstance(extent, int):

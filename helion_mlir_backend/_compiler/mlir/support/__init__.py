@@ -15,10 +15,12 @@ from .block_ids import block_id_from_key
 from .block_ids import symbol_origin_info
 from .errors import CompileTimeoutError
 from .errors import DynamicShapeError
+from .errors import LoweringStoppedError
 from .errors import MLIRBackendError
 from .errors import NodeLoweringError
 from .errors import ShapeError
 from .errors import UnsupportedOperationError
+from .errors import UnsupportedTargetError
 from .errors import ValueNotFoundError
 from .index_meta import IndexDescriptor
 from .index_meta import resolve_index_descriptor
@@ -31,10 +33,12 @@ __all__ = [
     "CompileTimeoutError",
     "DynamicShapeError",
     "IndexDescriptor",
+    "LoweringStoppedError",
     "MLIRBackendError",
     "NodeLoweringError",
     "ShapeError",
     "UnsupportedOperationError",
+    "UnsupportedTargetError",
     "ValueNotFoundError",
     "block_id_from_key",
     "mlir_dtype_to_torch",

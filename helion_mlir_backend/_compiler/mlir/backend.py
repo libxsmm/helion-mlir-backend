@@ -10,7 +10,8 @@ Registers as a Helion compiler backend named "mlir".  The backend:
 The generated MLIR is intentionally high-level: Linalg-on-Tensors phase
 functions plus a thin memref entry function that fixes the calling convention
 (no tiling or lowering to LLVM), so a downstream MLIR compiler can apply its
-own tiling, vectorization, and memory-placement passes.
+own tiling, vectorization, and memory-placement passes. What depends on the
+device (lowering, runtime, search space) is the kernel's target (``targets/``).
 """
 
 from __future__ import annotations
@@ -21,13 +22,13 @@ from typing import TYPE_CHECKING
 from helion import exc
 from helion._compiler.backend import Backend
 
+from ..targets import resolve_target
+from ..targets import target_config_keys
 from .support.debug import PIPELINE_CONFIG_KEY
-from .support.debug import default_pipeline
 from .support.errors import MLIRBackendError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Collection
     from collections.abc import Sequence
 
     from helion._compiler.compile_environment import CompileEnvironment
@@ -38,19 +39,6 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
 
 _CONFIG_KEYS = frozenset({"block_sizes", PIPELINE_CONFIG_KEY})
-_OPT_MIN_TILE = 32
-"""Inner tiles narrower than 32 waste vector lanes."""
-
-
-def raise_block_minimums(
-    config_spec: ConfigSpec, outer_block_ids: Collection[int] = ()
-) -> None:
-    """Search (and default) tiles of at least 32 where the dimension allows, but
-    any size for ``outer_block_ids``: small outer tiles add parallel work and keep
-    the compiled inner work small."""
-    for spec in config_spec.block_sizes:
-        if not set(spec.block_ids) & set(outer_block_ids):
-            spec.update_min(min(_OPT_MIN_TILE, spec.max_size))
 
 
 class MLIRBackend(Backend):
@@ -58,7 +46,7 @@ class MLIRBackend(Backend):
 
     Compilation (parsing, type propagation, device IR construction) uses
     Helion's backend-neutral pipeline. Only the final codegen step is replaced.
-    Autotuning is Helion's (one given config is used as is), timed on the CPU.
+    Autotuning is Helion's (one given config is used as is), timed on the host.
     """
 
     @property
@@ -71,10 +59,23 @@ class MLIRBackend(Backend):
 
     def supports_config_key(self, key: str) -> bool:
         """Only block sizes shape the generated IR; ``mlir_pipeline`` picks the
-        lighthouse pipeline (default: ``HELION_MLIR_PIPELINE``, else ``opt``)."""
-        return key in _CONFIG_KEYS
+        target's lighthouse pipeline (default on the CPU: ``HELION_MLIR_PIPELINE``,
+        else ``opt``). Each target's lowering keys are
+        accepted on every device: the other targets ignore them."""
+        return key in _CONFIG_KEYS or key in target_config_keys()
 
     def supports_precompile(self) -> bool:
+        return False
+
+    @property
+    def pad_factory_tensors_to_power_of_2(self) -> bool:
+        """No: MLIR needs no power-of-two shapes, and the
+        padding changes semantics. With it, a dim used in an on-device
+        factory (``hl.zeros([tile, dim])``) gets a reduction block of
+        next_pow2(dim), and every ``.size()`` of a ``:`` slice of that dim
+        anywhere in the loop returns the padded size (64 for 40). Without
+        it, Helion keeps ``:`` slices and factory dims at their real sizes,
+        as for Pallas."""
         return False
 
     def autotune(
@@ -85,20 +86,20 @@ class MLIRBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        """Helion's autotuning; its default local cache becomes the CPU one. A
-        search under the optimizing pipeline tries tiles of at least 32 except for
-        the leading dim of each root loop."""
-        from .autotune import CPU_AUTOTUNE_CACHE
+        """Helion's autotuning; its default local cache becomes the MLIR one,
+        keyed by the target's hardware. A search runs in the space the kernel's
+        target narrows (on the CPU under the optimizing pipeline: tiles of at
+        least 32 except for the leading dim of each root loop)."""
+        from .autotune import AUTOTUNE_CACHE
 
         settings = bound_kernel.settings
         if settings.autotune_cache == "LocalAutotuneCache":
-            settings.autotune_cache = CPU_AUTOTUNE_CACHE
-        if default_pipeline() == "opt" and (
-            force or settings.force_autotune or not bound_kernel.kernel.configs
-        ):
-            device_ir = bound_kernel.host_function.device_ir
-            outer = [ids[0] for ids in device_ir.grid_block_ids if ids]
-            raise_block_minimums(bound_kernel.config_spec, outer)
+            settings.autotune_cache = AUTOTUNE_CACHE
+        if force or settings.force_autotune or not bound_kernel.kernel.configs:
+            target = resolve_target(bound_kernel.env.device)
+            target.adjust_config_spec(
+                bound_kernel.config_spec, bound_kernel.host_function.device_ir
+            )
         return super().autotune(bound_kernel, args, force=force, **kwargs)
 
     def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
@@ -228,7 +229,11 @@ class MLIRBackend(Backend):
         No host code runs: tensors the kernel creates on the host and writes are
         zero-initialized, and kernels that read host-computed tensors or take
         runtime scalars are rejected. Use ``compile_mlir`` or a direct kernel call
-        for full Helion semantics.
+        for full Helion semantics. The target follows the tensors' device (or
+        ``HELION_MLIR_TARGET``); ``pipeline`` defaults to the target's.
+
+        Inputs hold their values at the call: no host code is known here, so an
+        input sharing elements with a written tensor is a copy of it.
 
         Returns every tensor the kernel writes, in entry argument order: one
         tensor, or a list when there are several.
@@ -247,12 +252,15 @@ class MLIRBackend(Backend):
         device = input_tensors[0].device
         if any(tensor.device != device for tensor in input_tensors[1:]):
             raise ValueError("all input tensors must be on the same device")
-        if device.type != "cpu":
-            raise NotImplementedError(
-                f"Only CPU device supported for execution; got {device.type}"
+        target = resolve_target(device)
+        if pipeline is not None and pipeline not in target.pipelines:
+            raise ValueError(
+                f"unknown pipeline {pipeline!r}; expected one of {target.pipelines}"
             )
 
-        entry = compile_entry(mlir_module, kernel_name, pipeline=pipeline)
+        entry = compile_entry(
+            mlir_module, kernel_name, target=target, pipeline=pipeline
+        )
         values: list[object] = []
         alternatives = [
             "helion_mlir_backend.compile_mlir(kernel, args)",
@@ -268,7 +276,7 @@ class MLIRBackend(Backend):
                     alternatives=alternatives,
                 )
             elif arg.role == "inout":
-                values.append(torch.zeros(arg.shape, dtype=arg.dtype))
+                values.append(torch.zeros(arg.shape, dtype=arg.dtype, device=device))
             else:
                 raise UnsupportedOperationError(
                     f"execute_mlir cannot supply host value '{arg.name}'",

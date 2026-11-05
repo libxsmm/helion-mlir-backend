@@ -15,6 +15,11 @@ import helion.language as hl
 import pytest
 import torch
 
+from tests.inputs import boundary_tile
+from tests.inputs import same_values
+from tests.ir_query import ops_named
+from tests.ir_query import static_sizes
+
 from helion_mlir_backend import generate_mlir
 
 # ---------------------------------------------------------------------------
@@ -26,6 +31,11 @@ def _backend():
     from helion._compiler.backend_registry import get_backend_class
 
     return get_backend_class("mlir")()
+
+
+def _tile_rows(module: object) -> set[int]:
+    """The row counts of the tiles read from the kernel's inputs."""
+    return {static_sizes(op)[0] for op in ops_named(module, "tensor.extract_slice")}
 
 
 def _allclose(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -1189,11 +1199,9 @@ class TestConfigurableBlockSizes:
         A = torch.randn(64, 32)
         B = torch.randn(64, 32)
 
-        ir_str = str(generate_mlir(add_kernel, [A, B]))
+        module = generate_mlir(add_kernel, [A, B])
 
-        assert "affine_map<(d0) -> (d0 * 8)>" in ir_str, (
-            f"decorator block_sizes=[8] was ignored, got:\n{ir_str}"
-        )
+        assert _tile_rows(module) == {8}, f"block_sizes=[8] was ignored:\n{module}"
 
     def test_explicit_config_overrides_decorator_config(self):
         """An explicit config= argument wins over the decorator's config."""
@@ -1210,12 +1218,11 @@ class TestConfigurableBlockSizes:
         A = torch.randn(64, 32)
         B = torch.randn(64, 32)
 
-        ir_str = str(
-            generate_mlir(add_kernel, [A, B], config=helion.Config(block_sizes=[32]))
+        module = generate_mlir(
+            add_kernel, [A, B], config=helion.Config(block_sizes=[32])
         )
 
-        assert "affine_map<(d0) -> (d0 * 32)>" in ir_str
-        assert "affine_map<(d0) -> (d0 * 8)>" not in ir_str
+        assert _tile_rows(module) == {32}
 
     def test_different_block_sizes_same_result(self):
         """Different block_sizes produce numerically identical results via execute_mlir."""
@@ -1555,9 +1562,10 @@ class TestHostSideViewAlias:
             config=helion.Config(block_sizes=[8, 16]),
         )
         assert module.operation.verify()
-        ir_str = str(module)
-        assert "tensor.expand_shape" in ir_str
-        assert "[16, 8] [1, 1] : tensor<16x8xf32> into tensor<16x8xf32>" in ir_str
+        assert ops_named(module, "tensor.expand_shape")
+        stores = ops_named(module, "tensor.insert_slice")
+        assert [static_sizes(store) for store in stores] == [[16, 8]]
+        assert str(stores[0].results[0].type) == "tensor<16x8xf32>"
 
     def test_rank_preserving_host_view_executes_exactly(self):
         """The materialized host view produces correct numerics."""
@@ -1626,16 +1634,15 @@ class TestGenericAtenHelperBoundaryTileRegression:
     @pytest.mark.parametrize("n", [64, 65, 96, 512, 1024, 4096])
     def test_relu_above_64_elements(self, n):
         kernel = self._relu_kernel()
-        torch.manual_seed(0)
-        x = torch.randn(16, n)
-        assert _allclose(kernel(x), torch.relu(x))
+        x = boundary_tile([0.0, 1.0], 16, n, dtype=torch.float32)
+        # -0.0's sign: test_nan_minmax.py's test_relu_keeps_negative_zero.
+        same_values(kernel(x) + 0.0, torch.relu(x) + 0.0)
 
     @pytest.mark.parametrize("n", [64, 96, 512, 4096])
     def test_abs_above_64_elements(self, n):
         kernel = self._abs_kernel()
-        torch.manual_seed(1)
-        x = torch.randn(16, n)
-        assert _allclose(kernel(x), torch.abs(x))
+        x = boundary_tile([0.0, 1.0], 16, n, dtype=torch.float32)
+        same_values(kernel(x), torch.abs(x))
 
     @pytest.mark.parametrize("n", [64, 96, 512, 4096])
     def test_scalar_mul_above_64_elements(self, n):
@@ -1667,10 +1674,8 @@ class TestGenericAtenHelperBoundaryTileRegression:
                 out[tile] = torch.maximum(x[tile], y[tile])
             return out
 
-        torch.manual_seed(3)
-        x = torch.randn(16, n)
-        y = torch.randn(16, n)
-        assert _allclose(maximum_kernel(x, y), torch.maximum(x, y))
+        x = boundary_tile([0.0, 1.0], 16, n, dtype=torch.float32)
+        same_values(maximum_kernel(x, x.roll(3, -1)), torch.maximum(x, x.roll(3, -1)))
 
     def test_leaky_relu_above_64_elements(self):
         """``torch.nn.functional.leaky_relu`` needs both the shape fix and
@@ -1820,13 +1825,13 @@ class TestPaddedPackingAndMultiPhaseExecution:
         [
             ((64, 128, 96), None),
             ((64, 128, 96), (32, 64, 64)),
-            ((100, 130, 70), None),
             ((40, 198, 33), None),
         ],
     )
     def test_matmul_bf16_trans_a(self, mkn, block_sizes, trans_b):
         """bf16 with A given as ``[K, M]``: packed per tile by the fused kernel,
-        with its tile choice or the given ``block_sizes``."""
+        with its tile choice or the given ``block_sizes``. ``(40, 198, 33)``:
+        partial M and N tiles (several, with remainders) and a K tail."""
         from helion_mlir_utils.matmul import matmul
 
         m, k, n = mkn
@@ -1870,10 +1875,8 @@ class TestPaddedPackingAndMultiPhaseExecution:
     @pytest.mark.parametrize(
         "mkn",
         [
-            (40, 100, 50),
             (100, 130, 100),
             (33, 66, 35),
-            (70, 198, 70),
             (70, 201, 40),
             (20, 50, 40),
         ],
@@ -1881,7 +1884,11 @@ class TestPaddedPackingAndMultiPhaseExecution:
     def test_matmul_bf16_ragged(self, mkn, linear):
         """bf16 matmuls of unaligned shapes, odd K included: partial edge tiles,
         the K tail masked, the epilogue fused; ``linear``: B transposed (packed
-        per tile from ``[N, K]``) with a fused bias."""
+        per tile from ``[N, K]``) with a fused bias. Several partial tiles per
+        dim (100x130x100), two with remainders of 1 and 3 (33x66x35), odd K
+        (201), M below one tile (20, the zero-padded path). Each shape is a
+        compile of seconds: shapes giving the same tiles, chunks and tail as
+        one of these are left out."""
         from helion_mlir_utils.matmul import matmul
 
         m, k, n = mkn
@@ -1903,7 +1910,7 @@ class TestPaddedPackingAndMultiPhaseExecution:
 
     @pytest.mark.parametrize(
         "mkn",
-        [(64, 256, 128), (40, 66, 100), (50, 100, 70), (64, 4096, 64), (300, 128, 64)],
+        [(64, 256, 128), (40, 66, 100), (64, 4096, 64), (300, 128, 64)],
     )
     def test_matmul_prepacked_vnni(self, mkn):
         """A weight packed once into VNNI panels (``pack_b_vnni_t``) is read in

@@ -14,6 +14,7 @@ from . import inline_mlir_ops as inline_mlir_ops
 from . import load_slice_ops as load_slice_ops
 from . import loops as loops
 from . import memory_ops as memory_ops
+from . import print_ops as print_ops
 from . import scalar_ops as scalar_ops
 from . import tensor_creation_ops as tensor_creation_ops
 from . import tile_index_ops as tile_index_ops

@@ -129,10 +129,12 @@ class KernelGeometry:
 
     def owning_block(self, block_id: int, candidates: object) -> int | None:
         """The first of ``block_id`` and the tiles enclosing it in ``candidates``."""
+        seen = {block_id}
         while block_id not in candidates:
             block_id = self.enclosing_tiles.get(block_id)
-            if block_id is None:
+            if block_id is None or block_id in seen:
                 return None
+            seen.add(block_id)
         return block_id
 
     def block_size(self, block_id: int) -> int | None:

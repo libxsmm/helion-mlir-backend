@@ -76,8 +76,9 @@ force-single-line = true
 force-sort-within-sections = true
 
 [tool.codespell]
-# "inout": a tensor argument the kernel reads and writes (entry-function role).
-ignore-words-list = "inout,inouts"
+# "inout": a tensor argument the kernel reads and writes (entry-function role);
+# "olt": MLIR's ordered less-than predicate.
+ignore-words-list = "inout,inouts,olt"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -102,7 +103,7 @@ packages = ["helion_mlir_backend"]
 
 [tool.uv.sources]
 torch = { index = "pytorch" }
-lighthouse = { git = "https://github.com/llvm/lighthouse", rev = "eb90452" }
+lighthouse = { git = "https://github.com/llvm/lighthouse", rev = "f75ba24" }
 
 [[tool.uv.index]]
 name = "pytorch"

@@ -10,9 +10,12 @@ from mlir.dialects import arith as arith_d
 from mlir.dialects import linalg as linalg_d
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
+import sympy
 import torch
+from torch.utils._sympy.functions import FloorDiv
 
 from ..support import NodeLoweringError
+from ..support import UnsupportedOperationError
 from ..support import ValueNotFoundError
 from ..support import block_id_from_key
 from ..support import resolve_index_descriptor
@@ -53,9 +56,52 @@ def lower_get_symnode(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     # to a scalar index through their Helion symbol origin.
     info = ctx.node_symbol_info(node)
     resolved = scalar_tile_value(ctx, *info) if info is not None else None
-    if resolved is None:
-        raise ValueNotFoundError(node, context=f"invalid block key: {key!r}")
-    return resolved
+    if resolved is not None:
+        return resolved
+    if isinstance(value, torch.SymInt):
+        resolved = _symbolic_value(ctx, value.node.expr)
+        if resolved is None:
+            raise UnsupportedOperationError(
+                f"the tile expression {value.node.expr} in an inner loop",
+                reason=(
+                    "arithmetic on tile positions reaches an inner loop as an "
+                    "expression; +, -, *, //, min and max of tile positions and "
+                    "constants lower"
+                ),
+                alternatives=["compute it in the loop that uses it"],
+            )
+        return resolved
+    raise ValueNotFoundError(node, context=f"invalid block key: {key!r}")
+
+
+def _symbolic_value(ctx: BuildContext, expr: object) -> ir.Value | None:
+    """``expr``'s ``index`` value: arithmetic on tile positions captured by an inner
+    loop (``h = th.begin // group`` above it), which reaches the inner graph as its
+    symbolic expression. ``None`` for any other expression."""
+    if isinstance(expr, sympy.Integer):
+        return ctx.index_const(int(expr))
+    if isinstance(expr, sympy.Symbol):
+        info = ctx.symbol_info(expr)
+        return scalar_tile_value(ctx, *info) if info is not None else None
+    if isinstance(expr, FloorDiv):
+        combine, operands = arith_d.FloorDivSIOp, expr.args
+    elif isinstance(expr, sympy.Add):
+        combine, operands = arith_d.AddIOp, expr.args
+    elif isinstance(expr, sympy.Mul):
+        combine, operands = arith_d.MulIOp, expr.args
+    elif isinstance(expr, sympy.Max):
+        combine, operands = arith_d.MaxSIOp, expr.args
+    elif isinstance(expr, sympy.Min):
+        combine, operands = arith_d.MinSIOp, expr.args
+    else:
+        return None
+    values = [_symbolic_value(ctx, operand) for operand in operands]
+    if any(value is None for value in values):
+        return None
+    result = values[0]
+    for other in values[1:]:
+        result = combine(result, other).result
+    return result
 
 
 @lowers(torch.ops.aten.sym_size.int)

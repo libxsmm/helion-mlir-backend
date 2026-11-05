@@ -12,6 +12,8 @@ import pytest
 import torch
 
 from tests.harness import check_kernel
+from tests.inputs import boundary_tile
+from tests.inputs import close_values
 
 from helion_mlir_backend import generate_mlir
 from helion_mlir_backend._compiler.mlir.aten_bridge import helper_cache
@@ -101,6 +103,9 @@ def test_pointwise_ops() -> None:
         return torch.sigmoid(x) + torch.nn.functional.gelu(x) + torch.erf(x)
 
     check_kernel(pointwise_kernel, reference, [torch.randn(16, 32)], atol=1e-5)
+    x = boundary_tile([0.0, 1.0], 16, 32, dtype=torch.float32)
+    # f64's reference: torch's vectorized f32 gelu gives NaN at inf and inf at max.
+    close_values(pointwise_kernel(x), reference(x.double()).float(), 1e-5)
 
 
 @pytest.mark.parametrize("alpha", [0.25, 1.5])
@@ -113,6 +118,18 @@ def test_runtime_scalar_and_repeated_operand(alpha: float) -> None:
         return torch.where(x > alpha, torch.clamp_max(x * x, alpha), x)
 
     check_kernel(runtime_scalar_kernel, reference, [torch.randn(64), alpha])
+
+
+def test_runtime_scalar_compare_at_the_numbers_value() -> None:
+    """``v > alpha`` as torch does it, in the tile's type. ``x * x`` isn't exact over
+    the whole range, but is computed the same way in f32 by both."""
+    alpha = 0.1
+
+    def reference(x: torch.Tensor, alpha: float) -> torch.Tensor:
+        return torch.where(x > alpha, torch.clamp_max(x * x, alpha), x)
+
+    x = boundary_tile([alpha], 64, dtype=torch.float32)
+    check_kernel(runtime_scalar_kernel, reference, [x, alpha], exact=True)
 
 
 def test_contraction_with_repeated_operand() -> None:

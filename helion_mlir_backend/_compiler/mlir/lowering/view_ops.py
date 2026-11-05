@@ -42,7 +42,9 @@ def view(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     source = node.args[0]
     value = ctx.get_value(source)
     (result,) = infer_results(ctx, node)
-    shape = [static_dim(dim) for dim in result.shape]
+    shape = _static_shape(ctx, source, node, value) or [
+        static_dim(dim) for dim in result.shape
+    ]
     dynamic = any(
         ir.ShapedType.is_dynamic_size(dim)
         for dim in [*ir.RankedTensorType(value.type).shape, *shape]
@@ -50,6 +52,45 @@ def view(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     if dynamic and _non_unit_sizes(ctx, source) != _non_unit_sizes(ctx, node):
         return None
     return reshape(value, shape)
+
+
+def _static_shape(
+    ctx: BuildContext, source: torch.fx.Node, node: torch.fx.Node, value: ir.Value
+) -> list[int] | None:
+    """``node``'s shape as ints when its sizes are symbolic but ``value``, the
+    lowered source, is static: e.g. a full ``[256, 256]`` tile reshaped to
+    ``[tile.block_size // 32, 32, ...]``. Only if the source's sizes, with block
+    sizes substituted, are exactly ``value``'s dims (so the substitution holds
+    here) and the element counts match. Partial tiles under dynamic shapes are
+    padded to whole blocks, so they are static and qualify too; a source with
+    a dynamic dim (e.g. all columns of a dynamic extent) keeps its symbolic
+    sizes. A static result lowers to a view (``expand_shape``,
+    ``collapse_shape``), not a ``tensor.reshape``, which bufferizes to a copy of
+    a strided source."""
+    source_shape = list(ir.RankedTensorType(value.type).shape)
+    result_val = node.meta.get("val")
+    source_val = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
+    if not isinstance(result_val, torch.Tensor) or not isinstance(
+        source_val, torch.Tensor
+    ):
+        return None
+    if all(isinstance(dim, int) for dim in result_val.shape):
+        return None
+    if any(ir.ShapedType.is_dynamic_size(dim) for dim in source_shape):
+        return None
+
+    def ints(sizes: object) -> list[int] | None:
+        exprs = [ctx.sizes.expr(size) for size in sizes]
+        if any(expr.free_symbols or not expr.is_integer for expr in exprs):
+            return None
+        return [int(expr) for expr in exprs]
+
+    if ints(source_val.shape) != source_shape:
+        return None
+    shape = ints(result_val.shape)
+    if shape is None or any(dim <= 0 for dim in shape):
+        return None
+    return shape if _numel(shape) == _numel(source_shape) else None
 
 
 def _non_unit_sizes(ctx: BuildContext, node: torch.fx.Node) -> list[sympy.Expr]:

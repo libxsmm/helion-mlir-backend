@@ -29,7 +29,6 @@ _REASONS = {
     hl.randint: "no device random number generator",
     hl.inline_asm_elementwise: "inline assembly is target specific",
     hl.inline_triton: "inline Triton code needs the Triton backend",
-    hl.device_print: "no device printing",
 }
 
 

@@ -120,6 +120,8 @@ def split_sum(x: torch.Tensor) -> torch.Tensor:
 
 
 def row_var(x: torch.Tensor) -> torch.Tensor:
+    # float64: torch-mlir's decomposition of var and std computes in f64. On the CPU; on the
+    # XPU Helion stops these kernels before any IR (a bare AssertionError).
     out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     for tm in hl.tile(x.size(0)):
         out[tm] = torch.var(x[tm, :], dim=-1, unbiased=False)

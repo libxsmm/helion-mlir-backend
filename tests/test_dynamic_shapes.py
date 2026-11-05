@@ -4,6 +4,7 @@ bucket, sizes resolved at run time, never specialized to the example sizes."""
 from __future__ import annotations
 
 from itertools import starmap
+import re
 
 import helion
 import helion.language as hl
@@ -12,6 +13,7 @@ import sympy
 import torch
 
 from tests.harness import check_kernel
+from tests.harness import lower_opt_with_amx
 from tests.harness import opt_pipeline
 
 from helion_mlir_backend import generate_mlir
@@ -395,6 +397,33 @@ def test_execute_mlir_rejects_host_created_dynamic_tensors() -> None:
         UnsupportedOperationError, match="only known when the host code runs"
     ):
         MLIRBackend().execute_mlir(module, x, kernel_name="row_softmax")
+
+
+# A block larger than its dim: this kernel took very long in LLVM (a 128x4 copy
+# of the pad, its n-D transfer threaded through one scf.if per row), so the IR is
+# checked before it's compiled.
+@pytest.mark.isolated
+@pytest.mark.parametrize("block", [128, 512])
+def test_transpose_of_a_block_larger_than_its_dim_compiles(block: int) -> None:
+    kernel = helion.kernel(
+        transpose_rows.fn,
+        backend="mlir",
+        static_shapes=False,
+        config=helion.Config(block_sizes=[block]),
+    )
+    torch.manual_seed(0)
+    x = torch.randn(48, 48)
+    module = generate_mlir(kernel, [x])
+    lowered = lower_opt_with_amx(
+        module, kernel.fn.__name__, lambda _stage, after: "omp." in str(after)
+    )
+    assert lowered is not None
+    assert not re.search(r"vector<\d{3,}x\d+xf32>", str(lowered[1]))
+    runs = list(starmap(torch.randn, ((48, 48), (48, 300), (300, 48), (7, 129))))
+    for x in runs:
+        with opt_pipeline():
+            out = kernel(x.clone())
+        assert torch.equal(out, x.t())
 
 
 @pytest.mark.isolated

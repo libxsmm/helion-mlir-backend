@@ -70,7 +70,7 @@ def lower_if(ctx: BuildContext, node: torch.fx.Node) -> emit.Results:
         with ir.InsertionPoint(block):
             for name in names:
                 ctx.tensors.rebind(name, before[name])
-            outputs = lower_subgraph(
+            outputs = _guarded_subgraph(
                 ctx, graphs[graph_id].graph, [ctx.get_value(arg) for arg in args]
             )
             branch_yields.append(
@@ -145,7 +145,7 @@ def lower_while(ctx: BuildContext, node: torch.fx.Node) -> emit.Results:
         carried = list(after.arguments)
         for name, value in zip(names, carried[count:], strict=True):
             ctx.tensors.rebind(name, value)
-        outputs = lower_subgraph(
+        outputs = _guarded_subgraph(
             ctx,
             graphs[body_id].graph,
             with_carried(inputs, positions, carried[:count]),
@@ -156,6 +156,18 @@ def lower_while(ctx: BuildContext, node: torch.fx.Node) -> emit.Results:
     for name, value in zip(names, results[count:], strict=True):
         ctx.tensors.rebind(name, value)
     return emit.Results(results[:count])
+
+
+def _guarded_subgraph(
+    ctx: BuildContext, graph: torch.fx.Graph, inputs: list[ir.Value]
+) -> list[ir.Value]:
+    """``lower_subgraph`` of an ``if`` branch or a ``while`` body: its accesses
+    run only where the condition holds (``ctx.guard_depth``)."""
+    ctx.guard_depth += 1
+    try:
+        return lower_subgraph(ctx, graph, inputs)
+    finally:
+        ctx.guard_depth -= 1
 
 
 def lower_subgraph(

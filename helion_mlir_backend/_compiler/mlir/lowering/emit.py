@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import starmap
 from typing import TYPE_CHECKING
 
 from mlir.dialects import affine as affine_d
@@ -260,6 +261,13 @@ def pad_high(value: ir.Value, sizes: list[Size], shape: list[int]) -> ir.Value:
     with ir.InsertionPoint(body):
         tensor_d.YieldOp(constant(element_type, 0))
     return pad.result
+
+
+def keep_past(value: ir.Value, old: ir.Value, bounds: dict[int, ir.Value]) -> ir.Value:
+    """``old`` with its ``index(dim) < bounds[dim]`` part from ``value``."""
+    extents = list(starmap(bounds.get, enumerate(sizes(value))))
+    offsets = [constant(ir.IndexType.get(), 0) for _ in extents]
+    return insert_slice(extract_slice(value, offsets, extents), old, offsets, extents)
 
 
 def mask(value: ir.Value, bounds: dict[int, ir.Value], other: float) -> ir.Value:

@@ -324,3 +324,29 @@ def test_return_expression_is_evaluated_on_host():
     y = torch.randn(8, 8)
     result = two_phase_expression_return(x, y)
     torch.testing.assert_close(result, ((x + y) * 2.0).view(-1) + 1)
+
+
+def test_local_tensor_named_like_a_scalar_key():
+    """Regression: a host tensor named ``u0`` and a runtime scalar whose key is
+    ``u0`` shared one name table, so a later phase's call took the scalar for the
+    tensor ("operand type mismatch"), found on a generated Llama step."""
+
+    def two_phases(x: torch.Tensor, c: torch.Tensor, pos: int) -> torch.Tensor:
+        m, n = x.shape
+        u0 = torch.empty_like(x)
+        for tm, tn in hl.tile([m, n]):
+            u0[tm, tn] = x[tm, tn] * c[pos, tn]
+        hl.barrier()
+        for tm, tn in hl.tile([m, n]):
+            x[tm, tn] = u0[tm, tn] + 1.0
+        return x
+
+    kernel = helion.kernel(
+        two_phases,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[8] * 4),
+    )
+    x, c = torch.randn(8, 8), torch.randn(4, 8)
+    expected = x * c[2] + 1.0
+    torch.testing.assert_close(kernel(x.clone(), c, 2), expected)

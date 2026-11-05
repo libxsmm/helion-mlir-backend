@@ -48,6 +48,7 @@ def lower_load(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
         tensor_value,
         owned,
         name,
+        masked=extra_mask is not None,
     )
     loaded = load_tile(tensor_value, plan)
     gathers = plan.gathers()

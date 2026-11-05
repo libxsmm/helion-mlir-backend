@@ -40,6 +40,19 @@ class UnsupportedOperationError(MLIRBackendError):
         self.reason = reason
         self.alternatives = alternatives
 
+    def __reduce__(self) -> tuple:
+        # Rebuilt from its parts, not its message: it crosses process boundaries
+        # (lowering in a forked child).
+        args = (self.op_name, self.reason, self.alternatives)
+        return type(self), args, self.__dict__
+
+
+class UnsupportedTargetError(UnsupportedOperationError, NotImplementedError):
+    """Raised for a device (or target name) no MLIR target compiles for.
+
+    Also a :class:`NotImplementedError`, what device checks raised before targets.
+    """
+
 
 class ShapeError(MLIRBackendError):
     """Raised when shape inference fails."""
@@ -115,3 +128,17 @@ class CompileTimeoutError(MLIRBackendError):
         )
         self.pipeline = pipeline
         self.timeout = timeout
+
+
+class LoweringStoppedError(MLIRBackendError):
+    """Raised when a kernel to run was only lowered to an earlier stage: there is
+    nothing to JIT-compile."""
+
+    def __init__(self, target: str, stop_at: str | None) -> None:
+        super().__init__(
+            f"Lowering for the MLIR target '{target}' stops at '{stop_at}' by "
+            "default, so the kernel cannot run; "
+            "helion_mlir_backend.lower_mlir() returns the IR"
+        )
+        self.target = target
+        self.stop_at = stop_at

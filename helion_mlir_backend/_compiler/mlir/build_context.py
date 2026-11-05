@@ -12,10 +12,13 @@ from mlir.dialects import arith as arith_d
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 
+from .analysis.index_facts import IndexFacts
+from .analysis.index_facts import index_facts
 from .lowering.tensor_state import TensorState
 from .sizes import Sizes
 from .support import DynamicShapeError
 from .support import block_id_from_key
+from .support.errors import UnsupportedOperationError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -65,6 +68,9 @@ class BuildContext:
     signature: KernelSignature | None = None
     # Runtime scalar values of the current function, by ``_get_symnode`` key.
     scalars: dict[str, ir.Value] = field(default_factory=dict)
+    # Nesting depth of the ``if`` branches and ``while`` loops being lowered:
+    # accesses there run only where their condition holds.
+    guard_depth: int = 0
 
     mlir_module: ir.Module | None = None
     mlir_context: ir.Context | None = None
@@ -236,9 +242,49 @@ class BuildContext:
                 [ir.AffineConstantExpr.get(size), ir.AffineConstantExpr.get(end) - d0],
                 [offset],
             )
+        first, last = self.index_facts(begin), self.index_facts(end)
+        if (
+            size  # A tile of a loop that spans nothing has size 0.
+            and first.multiple % size == 0
+            and last.multiple % size == 0
+            and first.low is not None
+            and first.low >= 0
+        ):
+            return None  # A triangular loop, on tiles of the same grid.
         return emit.affine_min(
             [ir.AffineConstantExpr.get(size), d1 - d0], [offset, self.as_index(end)]
         )
+
+    def index_facts(self, value: int | ir.Value) -> IndexFacts:
+        """What is known of ``value``, as a multiple and bounds, from the loops it is
+        built from."""
+
+        def position(candidate: ir.Value) -> IndexFacts | None:
+            for block_id, offset in self.block_id_to_iv.items():
+                if offset != candidate:
+                    continue
+                if self.geometry.is_grid(block_id):
+                    # hl.grid may start below 0.
+                    first = self.block_id_to_bounds[block_id][0]
+                    return IndexFacts(low=self.index_facts(first).low)
+                begin, end = self.block_id_to_bounds[block_id]
+                size = self.geometry.tile_extent(block_id)
+                if not size:
+                    return None
+                first = self.index_facts(begin)
+                if not isinstance(begin, int) or not isinstance(end, int):
+                    return IndexFacts(
+                        size if not first.multiple % size else 1, first.low, None
+                    )
+                full = not (end - begin) % size
+                return IndexFacts(
+                    size if not begin % size else 1,
+                    begin,
+                    end - size if full else end - 1,
+                )
+            return None
+
+        return index_facts(value, position)
 
     @contextmanager
     def enter_for_loop(
@@ -249,6 +295,21 @@ class BuildContext:
         span: int | None = None,
     ) -> Generator[None]:
         """Bind a loop induction variable and bounds, restoring the previous ones."""
+        if block_id in self.block_id_to_iv:
+            raise UnsupportedOperationError(
+                "nested tile loops of one block size",
+                reason=(
+                    "both loops have one block id, from one block size or from one "
+                    "bounded by the other: their tiles would index with the inner "
+                    "loop's position"
+                ),
+                alternatives=[
+                    (
+                        "hl.register_block_size for each loop, bounded by a tensor's size, "
+                        "not by another block size"
+                    )
+                ],
+            )
         saved = [
             (table, table.get(block_id))
             for table in (

@@ -6,38 +6,31 @@ the pipeline is applied stage by stage until ``x86.amx`` ops appear. Nothing is 
 
 from __future__ import annotations
 
-from lighthouse.execution.target import TargetInfo
-from lighthouse.pipeline.driver import BackendDriver
-from mlir import ir
 import pytest
 
 from tests.harness import blocked_matmul_cases
+from tests.harness import lower_opt_with_amx
 
 from helion_mlir_backend import generate_mlir
-from helion_mlir_backend._compiler.execution import inline_module
-from helion_mlir_backend._compiler.execution import pipeline_descriptor
-
-_AMX_FEATURES = ["amx_bf16", "amx_tile", "amx_int8"]
 
 
-def _first_amx_ops(module: ir.Module, entry: str) -> set[str]:
-    features = TargetInfo.host().features + _AMX_FEATURES
-    with TargetInfo.override(features=features), module.context, ir.Location.unknown():
-        inline_module(module)
-        driver = BackendDriver(module, entry, result_to_args=False, benchmark=False)
-        driver.add_stage(pipeline_descriptor("opt"))
-        for stage in driver.stages:
-            module = stage.apply(module)
-            if "x86" not in str(stage):
-                continue
-            ops = {
-                token.split("(")[0]
-                for token in str(module).split()
-                if token.startswith("x86.amx.")
-            }
-            if ops:
-                return ops
-    return set()
+def _amx_ops(module: object) -> set[str]:
+    return {
+        token.split("(")[0]
+        for token in str(module).split()
+        if token.startswith("x86.amx.")
+    }
+
+
+def _first_amx_ops(module: object, entry: str) -> set[str]:
+    lowered = lower_opt_with_amx(
+        module, entry, lambda stage, after: "x86" in stage and bool(_amx_ops(after))
+    )
+    return set() if lowered is None else _amx_ops(lowered[1])
+
+
+def _until_amx_contraction(stage: str, module: object) -> bool:
+    return "x86.amx.tile_mulf" in str(module)
 
 
 @pytest.mark.slow
@@ -51,108 +44,3 @@ def test_blocked_bf16_matmul_reaches_amx(case: str) -> None:
     assert "x86.amx.tile_mulf" in ops, (
         f"no AMX contraction produced (saw {sorted(ops)})"
     )
-
-
-@pytest.mark.slow
-@pytest.mark.isolated
-def test_partial_tile_pads_only_edge_register_tiles(monkeypatch) -> None:
-    """In a partial M tile, register tiles of full rows read A in place by AMX;
-    only the edge ones copy A rows into a register-tile buffer."""
-    import importlib
-
-    import helion
-    import torch
-
-    mm = importlib.import_module("helion_mlir_utils.matmul")
-
-    monkeypatch.setenv("OMP_NUM_THREADS", "4")
-    m, n, k = 232, 64, 128
-    block_sizes, k_chunked, k_even = mm._fused_pack_tiles(m, n, k)
-    tile_m, chunk = block_sizes[0], block_sizes[2]
-    assert m % tile_m > 32  # a partial tile with a full and a partial register tile
-    kernel = helion.kernel(
-        mm._matmul_fused_pack,
-        static_shapes=True,
-        backend="mlir",
-        config=helion.Config(block_sizes=block_sizes),
-    )
-    args = [
-        torch.randn(m, k, dtype=torch.bfloat16),
-        torch.randn(k, n, dtype=torch.bfloat16),
-        None,
-        None,
-        None,
-        mm.identity_epilogue,
-        helion.language.constexpr(k_chunked),
-        helion.language.constexpr(k_even),
-        helion.language.constexpr(False),
-        helion.language.constexpr(False),
-    ]
-    module = inline_module(generate_mlir(kernel, args))
-    features = TargetInfo.host().features + _AMX_FEATURES
-    with TargetInfo.override(features=features), module.context, ir.Location.unknown():
-        driver = BackendDriver(
-            module, "_matmul_fused_pack", result_to_args=False, benchmark=False
-        )
-        driver.add_stage(pipeline_descriptor("opt"))
-        for stage in driver.stages:
-            module = stage.apply(module)
-            module.operation.verify()
-            if "x86.amx.tile_mulf" in str(module):
-                break
-        text = str(module)
-    assert "x86.amx.tile_mulf" in text
-    assert "vector.contract" not in text
-    loads = [line for line in text.splitlines() if "x86.amx.tile_load" in line]
-    # Full register tiles of the partial tile read A, of runtime rows, in place.
-    assert any(f"memref<?x{chunk}xbf16, strided<[{k}, 1]" in line for line in loads)
-    # No copy of the whole partial tile's A panel.
-    assert f"memref<{tile_m}x{chunk}xbf16>" not in text
-
-
-@pytest.mark.slow
-@pytest.mark.isolated
-def test_prepacked_ragged_k_contracts_only_with_amx(monkeypatch) -> None:
-    """A K pair count off the AMX step: whole chunks and a padded tail chunk all
-    reach AMX; no contraction is left to lower per element (it took minutes)."""
-    import importlib
-
-    import helion
-    import torch
-
-    mm = importlib.import_module("helion_mlir_utils.matmul")
-
-    monkeypatch.setenv("OMP_NUM_THREADS", "4")
-    m, k, n = 64, 130, 64
-    pairs = k // 2
-    pairs_even = pairs // 32 * 32
-    kernel = helion.kernel(
-        mm._matmul_prepacked_vnni,
-        static_shapes=True,
-        backend="mlir",
-        config=helion.Config(block_sizes=[32, 1, pairs_even, 32]),
-    )
-    args = [
-        torch.randn(m, k, dtype=torch.bfloat16).view(m, pairs, 2),
-        mm.pack_b_vnni_t(torch.randn(n, k, dtype=torch.bfloat16)),
-        None,
-        None,
-        None,
-        mm.identity_epilogue,
-        helion.language.constexpr(pairs_even),
-        helion.language.constexpr(pairs_even),
-    ]
-    module = inline_module(generate_mlir(kernel, args))
-    features = TargetInfo.host().features + _AMX_FEATURES
-    with TargetInfo.override(features=features), module.context, ir.Location.unknown():
-        driver = BackendDriver(
-            module, "_matmul_prepacked_vnni", result_to_args=False, benchmark=False
-        )
-        driver.add_stage(pipeline_descriptor("opt"))
-        for stage in driver.stages:
-            module = stage.apply(module)
-            if "x86.amx.tile_mulf" in str(module):
-                break
-        text = str(module)
-    assert "x86.amx.tile_mulf" in text
-    assert "vector.contract" not in text

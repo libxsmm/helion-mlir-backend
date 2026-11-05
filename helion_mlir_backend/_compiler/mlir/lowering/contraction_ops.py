@@ -24,6 +24,7 @@ from ..support.einsum_spec import EinsumNotContractible
 from ..support.einsum_spec import build_contract_spec
 from ..trace_mode import einsum_op_target
 from . import emit
+from .loops import keeps_zero
 from .registry import NOT_APPLICABLE
 from .registry import lowers
 
@@ -102,6 +103,7 @@ def emit_contraction(ctx: BuildContext, contraction: Contraction) -> ir.Value:
             f"contraction '{contraction.equation}'", reason=str(error)
         ) from error
 
+    _refuse_dot_of_padding(ctx, contraction, spec)
     operand_type = lhs_type.element_type
     result_type = _result_element_type(contraction.root, operand_type)
     if contraction.acc is None:
@@ -113,6 +115,35 @@ def emit_contraction(ctx: BuildContext, contraction: Contraction) -> ir.Value:
     acc = _operand(ctx, contraction.acc)
     _check_accumulator(contraction, spec, operand_type, result_type, acc)
     return _emit_op(contraction, spec, lhs, rhs, acc)
+
+
+def _refuse_dot_of_padding(
+    ctx: BuildContext, contraction: Contraction, spec: ContractSpec
+) -> None:
+    """Helion masks ``torch.addmm``'s operands but not ``hl.dot``'s: over a partial
+    tile's K, a computed operand's padding joins the sum. Refused unless both operands
+    provably keep it at 0, as loads do."""
+    dots = (contraction.root, *contraction.absorbed)
+    if not any(node.target is matmul_ops.dot for node in dots):
+        return
+    shape = contraction.lhs.meta["val"].shape
+    contracted = set(spec.lhs) & set(spec.rhs) - set(spec.out)
+    partial = any(
+        ctx.block_id_to_valid.get(ctx.env.resolve_block_id(shape[spec.lhs.index(dim)]))
+        is not None
+        for dim in contracted
+    )
+    if partial and not (
+        keeps_zero(ctx, contraction.lhs) and keeps_zero(ctx, contraction.rhs)
+    ):
+        raise UnsupportedOperationError(
+            "hl.dot of a computed operand over a partial tile",
+            reason="Helion doesn't mask its operands, so padding joins the sum",
+            alternatives=[
+                "torch.addmm, whose operands Helion masks",
+                "block sizes that divide the sizes they tile, with static_shapes=True",
+            ],
+        )
 
 
 def _operand(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:

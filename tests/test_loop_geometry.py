@@ -232,7 +232,7 @@ def test_sfc_remap_applies_to_normalized_forall() -> None:
     import mlir.ir as ir
 
     from helion_mlir_backend._compiler.execution import inline_module
-    from helion_mlir_backend._compiler.execution import pipeline_descriptor
+    from helion_mlir_backend._compiler.targets.cpu import pipeline_descriptor
 
     module = inline_module(
         generate_mlir(f32_matmul_32, [torch.randn(128, 64), torch.randn(64, 128)])
@@ -260,3 +260,59 @@ def test_sfc_matmul_executes_under_opt_pipeline() -> None:
     with opt_pipeline():
         result = f32_matmul_32(x, y)
     torch.testing.assert_close(result, x @ y, atol=1e-4, rtol=1e-4)
+
+
+@helion.kernel(backend="mlir", static_shapes=True, config=_cfg(32, 1, 32, 32, 1))
+def tile_expression_then_phase(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A tile expression in a local, read in an inner loop, with a phase after them."""
+    rows, n = x.size()
+    p = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tm, tb in hl.tile([n, rows]):
+        h = tb.begin // 4
+        acc = hl.zeros([tb, tm], dtype=torch.float32)
+        for tk in hl.tile(n):
+            acc = acc + y[h, tk].sum()
+        p[tb, tm] = acc
+    hl.barrier()
+    for tm, tb in hl.tile([n, rows]):
+        out[tb, tm] = p[tb, tm]
+    return out
+
+
+def test_tile_expression_then_phase() -> None:
+    """Regression: code after the loop made ``h`` a host argument, which failed with
+    "name 'h' is not defined"."""
+    torch.manual_seed(0)
+    check_kernel(
+        tile_expression_then_phase,
+        lambda x, y: y.sum(-1).repeat_interleave(4)[:, None].expand(x.shape),
+        [torch.randn(8, 64), torch.randn(2, 64)],
+    )
+
+
+@helion.kernel(backend="mlir", static_shapes=True, config=_cfg(32, 1, 32, 32, 1, 32))
+def tile_expression_past_its_loop(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A tile expression read after its loop ended, where no position exists."""
+    rows, n = x.size()
+    p = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tm, tb in hl.tile([n, rows]):
+        h = tb.begin // 4
+        acc = hl.zeros([tb, tm], dtype=torch.float32)
+        for tk in hl.tile(n):
+            acc = acc + y[h, tk].sum()
+        p[tb, tm] = acc
+    hl.barrier()
+    for tm, tb in hl.tile([n, rows]):
+        acc = hl.zeros([tb, tm], dtype=torch.float32)
+        for tk in hl.tile(n):
+            acc = acc + y[h, tk].sum()
+        out[tb, tm] = acc + p[tb, tm]
+    return out
+
+
+def test_tile_expression_past_its_loop_is_refused() -> None:
+    """Helion's tracer refuses it; no host argument or stale position comes of it."""
+    with pytest.raises(helion.exc.InternalError, match="AssertionError"):
+        tile_expression_past_its_loop(torch.zeros(8, 64), torch.zeros(2, 64))

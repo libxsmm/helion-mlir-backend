@@ -77,7 +77,14 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     index_nodes, value_node = node.args[1], node.args[2]
     extra_mask = node.args[3] if len(node.args) > 3 else node.kwargs.get("extra_mask")
     state = ctx.tensors.value(name)
-    plan = plan_slice(ctx, index_nodes, state, ctx.tensors.owned(name), name)
+    plan = plan_slice(
+        ctx,
+        index_nodes,
+        state,
+        ctx.tensors.owned(name),
+        name,
+        masked=extra_mask is not None,
+    )
     if plan.gathers():
         raise UnsupportedOperationError(
             "store", reason="stores indexed by a tensor (scatter) are not supported"
@@ -90,7 +97,7 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
         # Broadcast straight into the destination slice, never as its own tile.
         kept = [i for i, dim in enumerate(plan.dims) if not dim.reduces]
         dest = emit.extract_slice(state, plan.offsets(), plan.sizes())
-        stored = _broadcast(value, dest, kept)
+        stored = _broadcast(_real_part(value, plan), dest, kept)
         ctx.tensors.rebind(
             name, emit.insert_slice(stored, state, plan.offsets(), plan.sizes())
         )
@@ -109,6 +116,21 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     ctx.tensors.rebind(
         name, emit.insert_slice(value, state, plan.offsets(), plan.sizes())
     )
+
+
+def _real_part(value: ir.Value, plan: SlicePlan) -> ir.Value:
+    """A stored tile without its padding, in its dims that aren't broadcast: the
+    destination slice of a partial tile is shorter than they are."""
+    if not plan.is_partial():
+        return value
+    sizes = [
+        size if extent != 1 else 1
+        for size, extent in zip(
+            plan.value_sizes(), ir.RankedTensorType(value.type).shape, strict=True
+        )
+    ]
+    zeros = [emit.constant(ir.IndexType.get(), 0)] * len(sizes)
+    return emit.extract_slice(value, zeros, sizes)
 
 
 def _store_value(value: ir.Value, element_type: ir.Type, plan: SlicePlan) -> ir.Value:

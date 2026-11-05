@@ -18,7 +18,7 @@ einsum, ``acc + mm``      → one ``linalg.matmul``/``batch_matmul``/``contract`
 Pointwise aten ops        → ``linalg.generic`` or ``arith.*``
 ``_host_tensor(name)``    → the phase function's argument for that host tensor
 ``_get_symnode(bs_N)``    → the concrete block-size integer constant
-``_get_symnode(scalar)``  → the runtime scalar argument
+``_get_symnode(scalar)``  → the runtime scalar argument (by value)
 ``_phi``                  → the result of the enclosing ``scf.for``
 ``_new_var``              → pass-through (same MLIR value)
 
@@ -48,7 +48,6 @@ from typing import TYPE_CHECKING
 
 from mlir.dialects import bufferization as bufferization_d
 from mlir.dialects import func as func_d
-from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 
 from .analysis.signature import KernelSignature
@@ -146,9 +145,7 @@ class MLIRModuleBuilder:
         ctx = self.context
         refs = [*phase.ins, *phase.inouts]
         arg_types = [self._tensor_type(name) for name in refs]
-        arg_types += [
-            _scalar_tensor_type(ctx.signature.scalars[k]) for k in phase.scalars
-        ]
+        arg_types += [_scalar_type(ctx.signature.scalars[k]) for k in phase.scalars]
         result_types = [self._tensor_type(name) for name in phase.inouts]
         fn = func_d.FuncOp(
             f"{self.hf.name}__phase{index}",
@@ -160,15 +157,15 @@ class MLIRModuleBuilder:
             ctx.reset_for_new_function()
             args = list(entry.arguments)
             ctx.param_to_value.update(zip(refs, args[: len(refs)], strict=True))
-            for key, arg in zip(phase.scalars, args[len(refs) :], strict=True):
-                ctx.scalars[key] = tensor_d.ExtractOp(arg, []).result
+            ctx.scalars.update(zip(phase.scalars, args[len(refs) :], strict=True))
             ctx.sizes.begin_function(entry)
             results = build_phase_body(ctx, list(phase.root_positions), phase.inouts)
             func_d.ReturnOp(results)
         return fn
 
     def _build_entry_function(self, phases: list[func_d.FuncOp]) -> None:
-        """Public ``@<kernel>(inouts..., ins..., scalars...)`` over memrefs.
+        """Public ``@<kernel>(inouts..., ins..., scalars...)``: memrefs, then
+        runtime scalars by value (``f64``, ``i64``, ...).
 
         Inputs are ``restrict`` tensors, inouts ``restrict writable`` ones; each
         final inout value is committed with ``materialize_in_destination``.
@@ -177,11 +174,11 @@ class MLIRModuleBuilder:
         refs = [*signature.inouts, *signature.ins]
         scalars = list(signature.scalars.values())
         tensor_types = [self._tensor_type(ref.name) for ref in refs]
-        tensor_types += [_scalar_tensor_type(scalar) for scalar in scalars]
-        memref_types = [
+        arg_types = [
             ir.MemRefType.get(list(t.shape), t.element_type) for t in tensor_types
         ]
-        fn = func_d.FuncOp(self.hf.name, ir.FunctionType.get(memref_types, []))
+        arg_types += [_scalar_type(scalar) for scalar in scalars]
+        fn = func_d.FuncOp(self.hf.name, ir.FunctionType.get(arg_types, []))
         fn.attributes["sym_visibility"] = ir.StringAttr.get("public")
         fn.attributes["arg_attrs"] = ir.ArrayAttr.get(
             [_arg_attr(ref.name, _role(ref), ref.tensor_param) for ref in refs]
@@ -195,15 +192,15 @@ class MLIRModuleBuilder:
                 values[ref.name] = bufferization_d.ToTensorOp(
                     tensor_type, arg, restrict=True, writable=ref.written or None
                 ).result
-            for scalar, tensor_type, arg in zip(
-                scalars, tensor_types[len(refs) :], args[len(refs) :], strict=True
-            ):
-                values[scalar.key] = bufferization_d.ToTensorOp(
-                    tensor_type, arg, restrict=True
-                ).result
+            # Apart from the tensors: a scalar's key may equal a tensor's name.
+            scalar_values = {
+                scalar.key: arg
+                for scalar, arg in zip(scalars, args[len(refs) :], strict=True)
+            }
             for phase, fn_op in zip(signature.phases, phases, strict=True):
-                operands = [*phase.ins, *phase.inouts, *phase.scalars]
-                call = func_d.CallOp(fn_op, [values[name] for name in operands])
+                operands = [values[name] for name in (*phase.ins, *phase.inouts)]
+                operands += [scalar_values[key] for key in phase.scalars]
+                call = func_d.CallOp(fn_op, operands)
                 values.update(zip(phase.inouts, call.results, strict=True))
             for ref, arg in zip(refs, args, strict=False):
                 if ref.written:
@@ -244,8 +241,8 @@ class MLIRModuleBuilder:
         )
 
 
-def _scalar_tensor_type(scalar: ScalarArg) -> ir.RankedTensorType:
-    return ir.RankedTensorType.get([], torch_dtype_to_mlir(scalar.dtype))
+def _scalar_type(scalar: ScalarArg) -> ir.Type:
+    return torch_dtype_to_mlir(scalar.dtype)
 
 
 def _role(ref: TensorRef) -> str:

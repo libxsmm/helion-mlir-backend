@@ -13,6 +13,7 @@ import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import torch
 from torch._ops import OpOverload
 from torch._ops import OpOverloadPacket
 
@@ -21,7 +22,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import mlir.ir as ir
-    import torch
 
     from ..build_context import BuildContext
 
@@ -88,6 +88,58 @@ def lower_node(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
         return _dispatch(ctx, node)
 
 
+COUNTING_REDUCTIONS = {
+    torch.ops.aten.mean.dim,
+    torch.ops.aten.mean.default,
+    torch.ops.aten.var.dim,
+    torch.ops.aten.var.correction,
+    torch.ops.aten.std.dim,
+    torch.ops.aten.std.correction,
+    torch.ops.aten.var_mean.dim,
+    torch.ops.aten.var_mean.correction,
+    torch.ops.aten.std_mean.dim,
+    torch.ops.aten.std_mean.correction,
+}
+"""Reductions that count their elements: Helion masks a tile's padding but they
+would still divide by the tile's size."""
+
+
+def _reduced_sizes(node: torch.fx.Node) -> list[object]:
+    """The sizes a counting reduction reduces: its source sits behind the Inductor
+    buffer of ``_extra_args``, itself masked or not."""
+    dims = node.args[1] if len(node.args) > 1 else None
+    buffers = node.kwargs.get("_extra_args") or []
+    sizes: list[object] = []
+    for buffer in buffers:
+        if not isinstance(buffer, torch.fx.Node):
+            continue
+        for source in buffer.all_input_nodes:
+            shape = source.meta["val"].shape
+            picked = range(len(shape)) if dims is None else dims
+            sizes.extend(shape[dim] for dim in picked)
+    return sizes
+
+
+def refuse_counting_partial_tiles(ctx: BuildContext, node: torch.fx.Node) -> None:
+    """Refuse a reduction of :data:`COUNTING_REDUCTIONS` over a partial tile's dim:
+    a wrong result, silently (a mean of 12 elements of a tile of 16 is 12/16 of
+    it)."""
+    from ..support import UnsupportedOperationError
+
+    if node.target not in COUNTING_REDUCTIONS:
+        return
+    for size in _reduced_sizes(node):
+        if ctx.block_id_to_valid.get(ctx.env.resolve_block_id(size)) is not None:
+            raise UnsupportedOperationError(
+                f"{node.target} over a partial tile",
+                reason="it would divide by the tile's size, padding included",
+                alternatives=[
+                    "a sum over the tile divided by the count of real elements",
+                    "block sizes that divide the sizes they tile, with static_shapes=True",
+                ],
+            )
+
+
 def _dispatch(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
     from ..aten_bridge import is_aten_op
     from ..aten_bridge import lower_via_aten_helper
@@ -95,6 +147,7 @@ def _dispatch(ctx: BuildContext, node: torch.fx.Node) -> ir.Value | None:
 
     if node.op != "call_function":
         raise UnsupportedOperationError(node.op, reason=f"FX node kind of {node.name}")
+    refuse_counting_partial_tiles(ctx, node)
     for handler in handlers_for(node.target):
         result = handler(ctx, node)
         if result is not NOT_APPLICABLE:

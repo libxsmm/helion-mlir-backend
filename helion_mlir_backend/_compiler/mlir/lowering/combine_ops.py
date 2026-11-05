@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from helion.language import _tracing_ops as tracing_ops
 from helion.language import reduce_ops
 from helion.language import scan_ops
 from mlir.dialects import affine as affine_d
@@ -43,7 +44,52 @@ _ARITH: dict[object, tuple[type | None, type | None, type | None]] = {
     aten.minimum.default: (arith_d.MinimumFOp, arith_d.MinSIOp, None),
     aten.logical_and.default: (None, None, arith_d.AndIOp),
     aten.logical_or.default: (None, None, arith_d.OrIOp),
+    aten.bitwise_or.Tensor: (None, arith_d.OrIOp, arith_d.OrIOp),
 }
+
+_ZERO_NEUTRAL = (arith_d.AddFOp, arith_d.AddIOp, arith_d.OrIOp)
+"""Combiners padding's 0 doesn't change."""
+
+
+def _partial_tile(ctx: BuildContext, source: torch.fx.Node, dim: int) -> bool:
+    """``source``'s dim ``dim`` is a tile dim with a partial tile here."""
+    if source.op == "call_function" and source.target is tracing_ops._mask_to:
+        source = source.args[0]
+    size = source.meta["val"].shape[dim]
+    return ctx.block_id_to_valid.get(ctx.env.resolve_block_id(size)) is not None
+
+
+def _refuse_partial_tile(ctx: BuildContext, source: torch.fx.Node, dim: int) -> None:
+    """A reverse scan starts in the partial tile's padding: wrong values, silently."""
+    if _partial_tile(ctx, source, dim):
+        raise UnsupportedOperationError(
+            "a reverse hl.associative_scan over a partial tile",
+            reason="the scan would start in the tile's padding",
+            alternatives=[
+                "block sizes that divide the sizes they tile, with static_shapes=True"
+            ],
+        )
+
+
+def _refuse_masked_with_zero(
+    ctx: BuildContext, graph_id: int, source: torch.fx.Node, dim: int
+) -> None:
+    """``hl.reduce``'s ``other`` is what padded lanes hold, 0 by default, and then
+    Helion leaves no mask: wrong for any combiner but a sum, silently."""
+    masked = source.op == "call_function" and source.target is tracing_ops._mask_to
+    if (masked and source.args[1] != 0) or not _partial_tile(ctx, source, dim):
+        return
+    known = _known_combiner(ctx, graph_id, source.meta["val"].dtype)
+    if known is None or known[0] not in _ZERO_NEUTRAL:
+        raise UnsupportedOperationError(
+            "hl.reduce over a partial tile with other=0",
+            reason="padded lanes hold 0, which only a sum or an OR ignores",
+            alternatives=[
+                "other= the combiner's identity",
+                "a sum",
+                "block sizes that divide the sizes they tile, with static_shapes=True",
+            ],
+        )
 
 
 @lowers(reduce_ops._reduce)
@@ -52,6 +98,7 @@ def lower_reduce(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     graph_id, source, dim, keep_dims, is_tuple = _operands(node, "hl.reduce")
     if dim is None:
         raise UnsupportedOperationError("hl.reduce", reason="dim=None")
+    _refuse_masked_with_zero(ctx, graph_id, source, dim)
     value, dim, extent = _source(ctx, source, dim)
     known = _known_combiner(ctx, graph_id, source.meta["val"].dtype)
     if known is not None:
@@ -79,6 +126,9 @@ def lower_reduce(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
 def lower_scan(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
     """``_associative_scan(combine_graph, x, dim, reverse, is_tuple_input)``."""
     graph_id, source, dim, reverse, _ = _operands(node, "hl.associative_scan")
+    known = _known_combiner(ctx, graph_id, source.meta["val"].dtype)
+    if reverse and (known is None or known[0] not in _ZERO_NEUTRAL):
+        _refuse_partial_tile(ctx, source, dim)
     value, dim, extent = _source(ctx, source, dim)
     combine = _combine(ctx, graph_id)
     value_type = ir.RankedTensorType(value.type)
