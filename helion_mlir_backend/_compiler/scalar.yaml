@@ -1,6 +1,8 @@
 # Lighthouse's scalar pipeline, after lowering pack and unpack ops (which it
 # cannot bufferize) the way the optimizing pipeline does.
 Pipeline:
+  # No asserts in Linalg op bodies, as in the optimizing pipeline.
+  - schedule: "asserts.py[gen=remove_asserts]"
   - schedule: "x86/pack_lowering.py[gen=lower_packs_unpacks]{tile_size=32}"
   - include: cleanup.yaml
   - include: scalar-lowering.yaml

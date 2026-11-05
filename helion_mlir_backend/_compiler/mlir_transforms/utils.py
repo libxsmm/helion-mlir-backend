@@ -140,7 +140,8 @@ def pad_amount(pad: tensor.PadOp, high: bool, dim: int) -> int | ir.Value:
     ]
 
 
-def _int_constant(value: ir.Value) -> int | None:
+def int_constant(value: ir.Value) -> int | None:
+    """The value of the integer ``arith.constant`` defining ``value``, if any."""
     if isinstance(value, ir.OpResult) and isinstance(
         value.owner.opview, arith.ConstantOp
     ):
@@ -150,6 +151,24 @@ def _int_constant(value: ir.Value) -> int | None:
     return None
 
 
+def is_accumulator(value: ir.Value) -> bool:
+    """Whether every use of ``value`` is a ``vector.contract`` accumulator, or
+    an ``scf.for`` init of an iter arg whose uses all are."""
+    uses = list(value.uses)
+    if not uses:
+        return False
+    for use in uses:
+        owner = opview(use.owner)
+        if isinstance(owner, vector.ContractionOp) and use.operand_number == 2:
+            continue
+        if not isinstance(owner, scf.ForOp) or use.operand_number < 3:
+            return False
+        iter_arg = owner.inner_iter_args[use.operand_number - 3]
+        if not is_accumulator(iter_arg):
+            return False
+    return True
+
+
 def _min(bounds: Sequence[int | None]) -> int | None:
     known = [bound for bound in bounds if bound is not None]
     return min(known) if known else None
@@ -157,7 +176,7 @@ def _min(bounds: Sequence[int | None]) -> int | None:
 
 def _size_bound(value: ir.Value, depth: int = 0) -> int | None:
     """A constant upper bound of the index ``value``, if one is evident."""
-    if (constant := _int_constant(value)) is not None:
+    if (constant := int_constant(value)) is not None:
         return constant
     if depth > 16 or not isinstance(value, ir.OpResult):
         return None
@@ -181,7 +200,7 @@ def _size_bound(value: ir.Value, depth: int = 0) -> int | None:
     if isinstance(op, arith.AddIOp):
         bounds = [_size_bound(operand, depth + 1) for operand in op.operands]
         return None if None in bounds else sum(bounds)
-    if isinstance(op, tensor.DimOp) and (dim := _int_constant(op.index)) is not None:
+    if isinstance(op, tensor.DimOp) and (dim := int_constant(op.index)) is not None:
         return dim_bound(op.source, dim, depth + 1)
     return None
 

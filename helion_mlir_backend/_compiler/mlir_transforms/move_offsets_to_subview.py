@@ -9,8 +9,12 @@ extended for AMX operands: runtime shapes and strides, constant offsets kept
 in the indices and loop offsets split into subviews of their own.
 
 The subviews only re-base the indices: they keep the base's sizes, so extend
-past its end. Only in-bounds, unmasked reads are rewritten, as the bounds of
-any other read would be checked against the subview's sizes.
+past its end (``amx_move_offsets`` then fits accumulators' subviews to their
+reads: ``fit_subviews_to_reads``). One exception: a subview at a loop's
+induction variable of a base that is itself a subview, read directly in the
+loop's body, ends where the base does on the loop's last iteration
+(``_in_bounds_sizes``). Only in-bounds, unmasked reads are rewritten, as the
+bounds of any other read would be checked against the subview's sizes.
 """
 
 from mlir import ir
@@ -18,26 +22,40 @@ from mlir.dialects import affine
 from mlir.dialects import arith
 from mlir.dialects import ext
 from mlir.dialects import memref
+from mlir.dialects import scf
 from mlir.dialects import transform
 from mlir.dialects import vector
 from mlir.dialects.transform import DiagnosedSilenceableFailure
 
 from .dialect import HelionTransformDialect
 from .dialect import transform_op
+from .utils import int_constant
 from .utils import opview
 from .utils import payload_ops
 
 
-def _enclosing_loop_iv(op: ir.OpView) -> ir.Value | None:
-    """Induction variable of the innermost ``scf.for`` around ``op``."""
+def _enclosing_loop(op: ir.OpView) -> scf.ForOp | None:
+    """The innermost ``scf.for`` around ``op``."""
     parent = op.operation.parent
     while parent is not None:
         if parent.name == "scf.for":
-            return parent.regions[0].blocks[0].arguments[0]
+            return opview(parent)
         if parent.name in ("func.func", "omp.loop_nest"):
             return None
         parent = parent.parent
     return None
+
+
+def _last_iv(loop: scf.ForOp) -> int | None:
+    """The last value of ``loop``'s induction variable, if its bounds are
+    constants and it runs at least once."""
+    bounds = [int_constant(v) for v in (loop.lowerBound, loop.upperBound, loop.step)]
+    if None in bounds:
+        return None
+    lower, upper, step = bounds
+    if step <= 0 or upper <= lower:
+        return None
+    return lower + (upper - lower - 1) // step * step
 
 
 def _apply_op(value: ir.Value) -> affine.AffineApplyOp | None:
@@ -135,6 +153,38 @@ def _unit_stride_subview(
     return memref.subview(base, offsets, sizes, unit, result_type=result_type)
 
 
+def _in_bounds_sizes(
+    base: ir.Value,
+    sizes: list[ir.Value | int],
+    offsets: list[ir.Value],
+    loop: scf.ForOp | None,
+) -> list[ir.Value | int]:
+    """``sizes`` (``base``'s) of the subview of ``base`` at ``offsets``, with
+    each static dim at ``loop``'s induction variable cut to end where
+    ``base`` does on the last iteration, if ``base`` is itself a
+    ``memref.subview``.
+
+    The cut dim then stays in bounds on every iteration. With ``base``'s
+    whole size it does not: once the AMX rewrite peels the last iteration,
+    its offset folds to a constant, and ``fold-memref-alias-ops`` composes
+    it with ``base`` into one subview with a static offset past the end,
+    which fails to verify. (Other bases are left as they were: their
+    subviews are not composed.) The reads stay in bounds of the cut dim:
+    they were in bounds of ``base`` at the last offset."""
+    if not isinstance(base, ir.OpResult) or base.owner.name != "memref.subview":
+        return sizes
+    last_iv = None if loop is None else _last_iv(loop)
+    if last_iv is None:
+        return sizes
+    iv = loop.induction_variable
+    return [
+        size - last_iv
+        if isinstance(size, int) and offset == iv and 0 < last_iv < size
+        else size
+        for size, offset in zip(sizes, offsets, strict=True)
+    ]
+
+
 def _is_rewritable(read: vector.TransferReadOp) -> bool:
     if not isinstance(read.base.type, ir.MemRefType) or read.mask is not None:
         return False
@@ -174,7 +224,8 @@ def _move_offsets(
         offsets.append(rest)
         indices.append(arith.ConstantOp(index, constant).result if constant else zero)
 
-    iv = _enclosing_loop_iv(read)
+    loop = _enclosing_loop(read)
+    iv = None if loop is None else loop.induction_variable
     splits = [_split_loop_offset(offset, iv) for offset in offsets]
     if any(splits):
         outer_offsets: list[ir.Value] = []
@@ -190,7 +241,14 @@ def _move_offsets(
         outer = _unit_stride_subview(base, outer_offsets, sizes)
         subview = _unit_stride_subview(outer, inner_offsets, sizes)
     else:
-        subview = _unit_stride_subview(base, offsets, sizes)
+        # Cut only for a read directly in the loop's body: one under an
+        # scf.if need not run on the last iteration.
+        direct = loop is not None and read.operation.parent == loop.operation
+        subview = _unit_stride_subview(
+            base,
+            offsets,
+            _in_bounds_sizes(base, sizes, offsets, loop) if direct else sizes,
+        )
 
     moved = vector.transfer_read(
         read.vector.type,

@@ -1,9 +1,20 @@
 # The optimizing (opt) pipeline.
 Pipeline:
+  # As Lighthouse's x86 pipeline: no asserts in Linalg op bodies (torch-mlir's
+  # reciprocal asserts a nonzero input, which a zero-padded partial tile is
+  # not; eager PyTorch returns inf).
+  - schedule: "asserts.py[gen=remove_asserts]"
   # Cleanup freshly imported IR.
   - pass: symbol-dce
   - pass: cse
   - pass: canonicalize
+  # A partial grid tile's store overwrites its whole region, which has a
+  # dynamic size: the stored tile replaces the region (upstream folds this only
+  # for static sizes), else bufferization copies the region into a heap buffer
+  # before every tile, full ones too.
+  - schedule: "helion_transforms.py[gen=fold_full_insert_slices]"
+  ## Outputs a top-level parallel loop overwrites whole, for first_touch_outputs.
+  - schedule: "helion_transforms.py[gen=mark_overwritten_args]"
 
   # Based on Lighthouse's x86 pipeline.
   # Skips packing as the entry-level IR from Helion already contains parallel loops.
@@ -16,8 +27,14 @@ Pipeline:
 
   ## Small transposes stay one vector transpose: register tiling unrolls narrow ones per element.
   - schedule: "helion_transforms.py[gen=pin_transposes]"
+  ## Contraction operands computed in a generic's body (fused above, e.g. an
+  ## exp or a bf16 rounding) as elementwise ops: raising the generic to a
+  ## linalg.contract (next step, and linalg-categorize-ops) drops them.
+  - schedule: "helion_transforms.py[gen=split_contraction_operands]"
   # Simplify shapes.
   - schedule: "linalg.py[gen=linalg_contract_fold_unit_dims]"
+  ## Its rank-reduced pads as reshapes, which materialize_operand_pads reads through.
+  - schedule: "helion_transforms.py[gen=fold_pad_unit_inserts]"
   - include: cleanup.yaml
 
   ## Remap iteration space of parallel loops for communication avoidance.
@@ -25,6 +42,10 @@ Pipeline:
 
   ## Normalize ops to category.
   - pass: "linalg-categorize-ops"
+  ## AMX contractions in the layouts upstream's AMX rewrite assumes (it checks
+  ## shapes, not maps): swapped operands (x @ w.T) read a transposed copy; layouts
+  ## it cannot normalize are kept off AMX (pin_amx_off_tile_sizes below).
+  - schedule: "helion_transforms.py[gen=normalize_amx_contractions]"
   ## Partial tiles' zero-padded operands read through packs are copied into buffers.
   - schedule: "helion_transforms.py[gen=materialize_operand_pads]{packed_only=True}"
   ## Operand packs (e.g. VNNI B tiles) run once per contraction, not per register tile.
@@ -33,6 +54,9 @@ Pipeline:
 
   ## 2) CPU register-level tiling - ensure data fits in registers.
   ## Parallel register tiles: assign/propagate from contraction anchors and fuse.
+  ## Contractions kept off AMX (normalize_amx_contractions) tiled as without AMX;
+  ## each tiling stage re-tiles the ops the previous one made.
+  - schedule: "helion_transforms.py[gen=pin_amx_off_tile_sizes]{strategy=register_parallel}"
   - include: x86_64/tile-and-fuse.yaml {
                                   strategy=register_parallel
                                   propagate=True
@@ -50,10 +74,12 @@ Pipeline:
   ## Reduction register tiles: annotate K-like dims and tile ops individually.
   # Tiling clears the pins; operand packs must not be tiled into tiny ops either.
   - schedule: "helion_transforms.py[gen=pin_transposes]"
+  - schedule: "helion_transforms.py[gen=pin_amx_off_tile_sizes]{strategy=register_reduction}"
   - include: x86_64/fuse-reductions.yaml {
                           strategy=register_reduction
                           use_forall=False
                         }
+  - schedule: "helion_transforms.py[gen=pin_amx_off_tile_sizes]{strategy=register_reduction}"
   - include: x86_64/tile.yaml {
                           strategy=register_reduction
                           propagate=False
@@ -63,6 +89,7 @@ Pipeline:
 
   ## 3) CPU register-level unrolling via tiling - ensure hardware-friendly shapes.
   - schedule: "helion_transforms.py[gen=pin_transposes]"
+  - schedule: "helion_transforms.py[gen=pin_amx_off_tile_sizes]{strategy=register_unroll}"
   - include: x86_64/unroll-register.yaml
   - include: cleanup.yaml
   ## Register-tile temporaries (fused accumulator init, epilogues) sized per register tile.
@@ -90,8 +117,24 @@ Pipeline:
   # Per-tile scratch (accumulators, staging) on the stack: no malloc/free per tile.
   - schedule: "helion_transforms.py[gen=promote_buffers_to_stack]{max_alloc_size_in_bytes=1048576}"
   - include: bufferization-cleanup.yaml
+  # A versioned grid tile's copy into its output region made in the branches:
+  # the full version wrote the region in place and gets none, so only partial
+  # tiles copy (else every tile copies its region onto itself through
+  # memrefCopy). Then fold the casts and duplicate subviews this leaves.
+  - schedule: "helion_transforms.py[gen=sink_copies_into_branches]"
+  - pass: canonicalize
+  - pass: cse
+  - pass: canonicalize
+  ## Out-of-bounds n-D copies (pads, packs of partial tiles) row by row: split as
+  ## lone reads, their n-D vectors are rebuilt element by element.
+  - schedule: "helion_transforms.py[gen=split_copies]"
   - schedule: "helion_transforms.py[gen=split_transfers]"
   - schedule: "omp.py[gen=parallelize]"
+  ## A fresh output's pages faulted in by each thread in a contiguous slice before
+  ## the loop writing it: else dozens of threads zero the same huge pages at once.
+  - schedule: "helion_transforms.py[gen=first_touch_outputs]"
+  # Accumulator reads' subviews fitted to the register tile, which the AMX
+  # rewrite of a K loop takes them for.
   - schedule: "helion_transforms.py[gen=amx_move_offsets]"
   # The AMX rewrite rebuilds a K loop without the loop-invariant index ops defined in
   # it (outer tiles of several blocks): left in the erased loop, they abort the rewrite.
@@ -102,6 +145,9 @@ Pipeline:
   - pass: "func.func(convert-linalg-to-loops)"
   ## n-D transfers as 2-D ones, contiguous ones then 1-D: no per-element staging.
   - schedule: "helion_transforms.py[gen=unroll_transfers]"
+  # Canonicalization rebuilds the unrolled rows of a vector (e.g. around a VNNI
+  # pack's transpose) element by element: forwarded as rows when used as rows.
+  - schedule: "helion_transforms.py[gen=forward_rows]"
   - schedule: "vectorization.py[gen=flatten_vector_ops]"
   ## n-D elementwise ops (e.g. between reshapes of flattened transfers) as 1-D:
   ## lowered n-D, they unroll into per-row ops and shuffles.
@@ -117,4 +163,9 @@ Pipeline:
   # Stack buffers of transfers in a loop would grow the stack each iteration.
   - pass: "convert-vector-to-scf"
   - schedule: "helion_transforms.py[gen=hoist_allocas]"
+  ## Short-K AMX GEMMs with outputs beyond the last-level cache: else the stores wait
+  ## for DRAM.
+  - schedule: "helion_transforms.py[gen=prefetch_large_gemm]"
   - include: llvm-lowering.yaml
+  ## Loads of bf16 vectors of 8k+1 elements abort x86 code generation: split.
+  - schedule: "helion_transforms.py[gen=split_bf16_loads]"
