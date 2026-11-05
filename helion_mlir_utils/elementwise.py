@@ -8,11 +8,12 @@ import torch
 from torch import Tensor
 
 import helion_mlir_backend  # noqa: F401
+from helion_mlir_backend import output_pool
 
 
 @helion.kernel(backend="mlir", config=helion.Config(block_sizes=[8, 1024]))
 def _relu_kernel(x: Tensor) -> Tensor:
-    out = torch.empty_like(x)
+    out = output_pool.empty_like(x)
     for tile in hl.tile(x.shape):
         out[tile] = torch.relu(x[tile])
     return out
@@ -22,7 +23,7 @@ def _relu_kernel(x: Tensor) -> Tensor:
 # constant instead of a dynamic SymFloat (which it can't lower).
 @helion.kernel(backend="mlir", config=helion.Config(block_sizes=[8, 1024]))
 def _leaky_relu_kernel(x: Tensor, negative_slope: hl.constexpr) -> Tensor:
-    out = torch.empty_like(x)
+    out = output_pool.empty_like(x)
     for tile in hl.tile(x.shape):
         out[tile] = torch.nn.functional.leaky_relu(
             x[tile], negative_slope=negative_slope
@@ -32,7 +33,7 @@ def _leaky_relu_kernel(x: Tensor, negative_slope: hl.constexpr) -> Tensor:
 
 @helion.kernel(backend="mlir", config=helion.Config(block_sizes=[8, 1024]))
 def _scalar_mul_kernel(a: Tensor, s: hl.constexpr) -> Tensor:
-    out = torch.empty_like(a)
+    out = output_pool.empty_like(a)
     for tile in hl.tile(a.shape):
         out[tile] = a[tile] * s
     return out
