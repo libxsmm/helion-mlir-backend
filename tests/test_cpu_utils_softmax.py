@@ -99,3 +99,14 @@ def test_out_of_place_leaves_the_input() -> None:
     before = x.clone()
     assert softmax(x).data_ptr() != x.data_ptr()
     assert torch.equal(x, before)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(("m", "n"), [(65, 577), (1025, 1089)])
+def test_softmax_bf16_ragged_rows_32k_plus_1(m: int, n: int) -> None:
+    """LLVM aborted on an x86 bf16 masked load of 32k+1 elements (LegalizeDAG),
+    which a softmax's rows reach (AI-bench L2/66, 84 and 99)."""
+    torch.manual_seed(2)
+    x = torch.randn(m, n).bfloat16()
+    out, ref = softmax(x).double(), x.double().softmax(-1)
+    assert ((out - ref).abs().max() / ref.abs().max()) < 6e-3

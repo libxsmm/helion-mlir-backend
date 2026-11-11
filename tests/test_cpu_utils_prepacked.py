@@ -789,3 +789,65 @@ def test_linear_panel_and_whole_rows_together(
         out, odd = linear(x, layer, torch.relu, panel=96, whole_rows=True)
         assert int(odd.packed_weight.shape[2]) == 96
         assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    "threads,m,n,k,panel",
+    [
+        # Panels that fit, and the few-rows rules.
+        (64, 1024, 8192, 1024, 256),
+        (64, 1024, 8192, 8192, 256),
+        (64, 16384, 4096, 2048, 256),
+        (64, 16384, 1024, 4096, 128),
+        (64, 128, 4096, 4096, 128),
+        (64, 128, 8192, 4096, 64),
+        (64, 128, 32768, 32768, 512),
+    ],
+)
+def test_vnni_panel_with_a_fitting_panel(
+    monkeypatch: pytest.MonkeyPatch, threads: int, m: int, n: int, k: int, panel: int
+) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", str(threads))
+    assert mm.vnni_panel(m, n, k) == panel
+
+
+@pytest.mark.parametrize("panel", [None, 64, 128, 256])
+def test_linear_chain_any_panel_matches_fp64(panel: int | None) -> None:
+    """AI-bench L3/3's shape class: the result must not depend on the tile the
+    panel sets (checked against fp64)."""
+    torch.manual_seed(7)
+    layer = torch.nn.Linear(1024, 1024).to(torch.bfloat16)
+    x = torch.rand(512, 1024).to(torch.bfloat16)
+    out, _ = linear(x, layer, torch.relu, panel=panel)
+    ref = torch.relu(
+        x.to(torch.float64) @ layer.weight.detach().to(torch.float64).T
+        + layer.bias.detach().to(torch.float64)
+    )
+    error = ((out.double() - ref).abs().max() / ref.abs().max()).item()
+    assert error < 1e-2
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k", "threads", "expected"),
+    [
+        (1048576, 768, 256, 64, (256, 768, 256)),  # AI-bench L1/11 bench-cpu
+        (16384, 768, 256, 64, (256, 768, 256)),  # one tile per thread
+        (16320, 768, 256, 64, None),  # fewer tiles than threads
+        (1048320, 768, 256, 64, (256, 768, 256)),
+        (1048321, 768, 256, 64, None),  # a partial row tile
+        (1048576, 760, 256, 64, None),  # partial register tiles
+        (1048576, 768, 264, 64, None),  # a K tail
+        (1048576, 2048, 512, 64, None),  # a 2 MiB B chunk
+        (1048576, 2048, 256, 64, None),  # 128 rows: too few to share
+    ],
+)
+def test_tall_output_tiles(
+    monkeypatch: pytest.MonkeyPatch,
+    m: int,
+    n: int,
+    k: int,
+    threads: int,
+    expected: tuple[int, int, int] | None,
+) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", str(threads))
+    assert mm.tall_output_tiles(m, n, k) == expected

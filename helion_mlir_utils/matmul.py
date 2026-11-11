@@ -733,8 +733,8 @@ def _matmul_prepacked_vnni_call(
     """:func:`matmul_prepacked_b` of a RHS packed by :func:`pack_b_vnni_t`.
 
     Rows past the last whole row tile run as a second call, zero-padded to
-    whole register tiles: a partial row tile lowers to per-element code (about
-    35 ms for one tile, 12x the whole GEMM at 131104x256x1536).
+    whole register tiles: a partial row tile lowers to per-element code, far slower
+    than the whole GEMM.
     """
     panels, pairs_b, panel, vnni = map(int, b4.shape)
     m, k = map(int, a.shape)
