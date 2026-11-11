@@ -228,6 +228,14 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         multiprocessing.forkserver.ensure_running()
 
 
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """Stop the fork server before Python's exit removes its temp dir."""
+    if _context is not None:
+        # CPython's own way to stop it (used by its tests): close the server's alive
+        # pipe, wait for it to exit, then remove the socket.
+        multiprocessing.forkserver._forkserver._stop()
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     marker = pyfuncitem.get_closest_marker("isolated")
