@@ -150,7 +150,7 @@ def _command(compiler: str, output: str) -> list[str]:
     return [
         compiler,
         "-O2",
-        "-std=c++17",
+        "-std=c++20",
         "-shared",
         "-fPIC",
         f"-D_GLIBCXX_USE_CXX11_ABI={abi}",

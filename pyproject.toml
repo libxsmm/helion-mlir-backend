@@ -19,7 +19,7 @@ dev = [
   "numpy",
   "python-dotenv",
   "helion==1.4.0",
-  "torch==2.13.0+cpu",
+  "torch==2.15.0+cpu",
   "ml-dtypes",
   "ruff==0.14.5", # Python linter and formatter
   "pre-commit", # Tool to manage and apply pre-commit hooks
