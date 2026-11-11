@@ -232,8 +232,11 @@ def pytest_unconfigure(config: pytest.Config) -> None:
     """Stop the fork server before Python's exit removes its temp dir."""
     if _context is not None:
         # CPython's own way to stop it (used by its tests): close the server's alive
-        # pipe, wait for it to exit, then remove the socket.
-        multiprocessing.forkserver._forkserver._stop()
+        # pipe, wait for it to exit, then remove the socket. It is private: on a
+        # Python without it, the server stops at exit as before.
+        stop = getattr(multiprocessing.forkserver._forkserver, "_stop", None)
+        if stop is not None:
+            stop()
 
 
 @pytest.hookimpl(tryfirst=True)
