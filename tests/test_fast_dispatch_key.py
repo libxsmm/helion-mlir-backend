@@ -793,6 +793,9 @@ def test_fork_after_a_planned_call() -> None:
     """On one thread: with a worker pool, the child hangs inside the compiled
     kernel, natively or not, with or without the fast key (seen at cd134f0)."""
     os.environ["OMP_NUM_THREADS"] = "1"
+    # The variable alone is too late where torch and the kernels share one OpenMP
+    # runtime (libomp preloaded): it read its thread count at torch's import.
+    torch.set_num_threads(1)
     kernel = _kernel()
     x = torch.arange(32.0)
     fn = _scaled_by(hl.constexpr(2.0))
